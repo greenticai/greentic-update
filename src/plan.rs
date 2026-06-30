@@ -193,8 +193,8 @@ pub struct VerifiedUpdatePlan {
 pub enum PlanError {
     #[error("update-plan signing: {0}")]
     Sign(#[from] SigningError),
-    #[error("update-plan serialize: {0}")]
-    Serialize(serde_json::Error),
+    #[error("update-plan JSON: {0}")]
+    Json(serde_json::Error),
     /// The signing key's id is not in the target environment's trust root.
     /// Refused before any bytes are produced — a plan the environment cannot
     /// verify is worse than no plan.
@@ -253,10 +253,15 @@ pub fn build_update_plan(
 ) -> Result<BuiltUpdatePlan, PlanError> {
     // Refusal runs first so a failed precondition yields NO bytes for the
     // caller to half-persist.
-    let trusted = trust_root
-        .keys
-        .iter()
-        .any(|k| k.key_id.eq_ignore_ascii_case(key_id));
+    // Match `TrustRoot::find`'s contract: an empty key id never resolves to a
+    // trusted key on either side. Without the guard an empty/empty match would
+    // pass here and only fail later in the self-verify with a confusing
+    // `NoTrustedKey` instead of a clear refusal.
+    let trusted = !key_id.is_empty()
+        && trust_root
+            .keys
+            .iter()
+            .any(|k| !k.key_id.is_empty() && k.key_id.eq_ignore_ascii_case(key_id));
     if !trusted {
         return Err(PlanError::KeyNotTrusted {
             key_id: key_id.to_string(),
@@ -270,7 +275,7 @@ pub fn build_update_plan(
         });
     }
 
-    let plan_bytes = serde_json::to_vec_pretty(plan).map_err(PlanError::Serialize)?;
+    let plan_bytes = serde_json::to_vec_pretty(plan).map_err(PlanError::Json)?;
     let plan_sha256 = sha256_hex(&plan_bytes);
 
     let predicate = UpdatePlanPredicate {
@@ -281,7 +286,7 @@ pub fn build_update_plan(
         created_at: plan.created_at,
         nonce: plan.nonce.clone(),
     };
-    let predicate_value = serde_json::to_value(&predicate).map_err(PlanError::Serialize)?;
+    let predicate_value = serde_json::to_value(&predicate).map_err(PlanError::Json)?;
 
     let mut digest = BTreeMap::new();
     digest.insert("sha256".to_string(), plan_sha256.clone());
@@ -296,7 +301,7 @@ pub fn build_update_plan(
     };
 
     let envelope = sign_statement(&statement, signing_key_pkcs8_pem, key_id)?;
-    let envelope_bytes = serde_json::to_vec_pretty(&envelope).map_err(PlanError::Serialize)?;
+    let envelope_bytes = serde_json::to_vec_pretty(&envelope).map_err(PlanError::Json)?;
 
     // Self-verify before returning — a key/trust mismatch fails the build, not
     // a later reader.
@@ -336,10 +341,9 @@ pub fn verify_update_plan(
         )));
     }
     let predicate: UpdatePlanPredicate =
-        serde_json::from_value(verified.statement.predicate.clone())
-            .map_err(PlanError::Serialize)?;
+        serde_json::from_value(verified.statement.predicate.clone()).map_err(PlanError::Json)?;
 
-    let plan: UpdatePlan = serde_json::from_slice(plan_bytes).map_err(PlanError::Serialize)?;
+    let plan: UpdatePlan = serde_json::from_slice(plan_bytes).map_err(PlanError::Json)?;
     if plan.schema != UPDATE_PLAN_SCHEMA_V1 {
         return Err(PlanError::SchemaMismatch {
             expected: UPDATE_PLAN_SCHEMA_V1.to_string(),
@@ -348,8 +352,12 @@ pub fn verify_update_plan(
     }
 
     // The document is the source of truth (its bytes are what the subject
-    // pins); a divergent predicate signals a malformed or hostile signer.
-    if predicate.plan_id != plan.plan_id
+    // pins); a divergent predicate signals a malformed or hostile signer. The
+    // predicate's own `schema` mirror is pinned to the predicate-type constant
+    // (the statement-level `predicate_type` checked above is the authoritative
+    // type guard; this closes the doc-promised "every field" cross-check).
+    if predicate.schema != UPDATE_PLAN_PREDICATE_TYPE_V1
+        || predicate.plan_id != plan.plan_id
         || predicate.env_id != plan.env_id
         || predicate.sequence != plan.sequence
         || predicate.nonce != plan.nonce
@@ -788,5 +796,60 @@ mod tests {
         let bytes = serde_json::to_vec_pretty(&plan).unwrap();
         let back: UpdatePlan = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(plan, back);
+    }
+
+    /// A predicate whose inner `schema` mirror is wrong — but whose
+    /// statement-level `predicateType` and every identity field are correct —
+    /// must still be rejected. Guards the defense-in-depth schema cross-check.
+    #[test]
+    fn wrong_inner_predicate_schema_is_rejected() {
+        let (priv_pem, tk) = test_key(7);
+        let trust = TrustRoot::new(vec![tk.clone()]);
+        let plan = sample_plan(5);
+        let plan_bytes = serde_json::to_vec_pretty(&plan).unwrap();
+        let plan_sha = sha256_hex(&plan_bytes);
+
+        let lying_predicate = UpdatePlanPredicate {
+            schema: "greentic.revenue-policy-predicate.v1".to_string(), // wrong mirror
+            plan_id: plan.plan_id.clone(),
+            env_id: plan.env_id.clone(),
+            sequence: plan.sequence,
+            created_at: plan.created_at,
+            nonce: plan.nonce.clone(),
+        };
+        let mut digest = BTreeMap::new();
+        digest.insert("sha256".to_string(), plan_sha);
+        let statement = InTotoStatement {
+            type_: INTOTO_STATEMENT_TYPE.to_string(),
+            subject: vec![DsseSubject {
+                name: "update-plan/plan-abc".to_string(),
+                digest,
+            }],
+            // Statement-level type is correct, so only the inner-schema check
+            // can reject this.
+            predicate_type: UPDATE_PLAN_PREDICATE_TYPE_V1.to_string(),
+            predicate: serde_json::to_value(&lying_predicate).unwrap(),
+        };
+        let envelope = sign_statement(&statement, &priv_pem, &tk.key_id).unwrap();
+        let envelope_bytes = serde_json::to_vec_pretty(&envelope).unwrap();
+
+        let err = verify_update_plan(&plan_bytes, &envelope_bytes, &trust)
+            .expect_err("wrong inner predicate schema rejected");
+        assert!(matches!(err, PlanError::PredicateMismatch(_)));
+    }
+
+    /// An empty signing key id is refused with a clear `KeyNotTrusted` even when
+    /// the trust root is misconfigured with an empty-key-id entry — rather than
+    /// signing and then failing the self-verify with a confusing `NoTrustedKey`.
+    #[test]
+    fn empty_key_id_is_refused_even_with_empty_trust_entry() {
+        let (priv_pem, tk) = test_key(7);
+        let trust = TrustRoot::new(vec![TrustedKey {
+            key_id: String::new(),
+            public_key_pem: tk.public_key_pem.clone(),
+        }]);
+        let err = build_update_plan(&sample_plan(1), &priv_pem, "", &trust)
+            .expect_err("empty key id refused");
+        assert!(matches!(err, PlanError::KeyNotTrusted { .. }));
     }
 }

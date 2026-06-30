@@ -29,5 +29,5 @@ thiserror = "2"
 
 [dev-dependencies]
 # Deterministic Ed25519 test keypairs (PKCS#8 / SPKI PEM) for plan signing tests.
+# `serde_json` is a normal dependency, so tests use it without re-declaring here.
 ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
-serde_json = "1"

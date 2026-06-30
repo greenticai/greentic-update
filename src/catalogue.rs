@@ -278,4 +278,30 @@ mod tests {
         assert_eq!(cat.get("a").unwrap().digest, "sha256:aaa");
         assert!(cat.get("missing").is_none());
     }
+
+    #[test]
+    fn duplicate_planned_names_yield_separate_items() {
+        // `diff` does not collapse duplicates — the caller owns dedup of the
+        // plan's artifact list. Two planned entries sharing a name produce two
+        // independent items (worst case a redundant download, never a silent
+        // skip). This locks that by-contract behavior.
+        let cat = InstalledCatalogue::default();
+        let plan = vec![
+            planned("a", "1.0.0", "sha256:111"),
+            planned("a", "2.0.0", "sha256:222"),
+        ];
+        let work = diff(&cat, &plan);
+        assert_eq!(work.items.len(), 2);
+        assert!(work.items.iter().all(|i| i.planned.name == "a"));
+        assert_eq!(work.to_download().len(), 2);
+    }
+
+    #[test]
+    fn digest_prefix_mismatch_counts_as_different() {
+        // A bare hex and a `sha256:`-prefixed digest are NOT equal — a prefix
+        // mismatch conservatively yields `Update`, never a silent skip. Case is
+        // still ignored within an otherwise-identical string.
+        assert!(!digests_match("sha256:abcdef", "abcdef"));
+        assert!(digests_match("sha256:abcdef", "sha256:ABCDEF"));
+    }
 }
