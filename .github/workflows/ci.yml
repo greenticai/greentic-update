@@ -1,0 +1,16 @@
+name: CI
+on:
+  workflow_call:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    uses: greenticai/.github/.github/workflows/host-crate-ci.yml@main

@@ -1,0 +1,21 @@
+[package]
+name = "greentic-update"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Greentic update platform foundation: signed update plans, installed-artifact catalogue/diff, staging, and airgap envelopes."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/greenticai/greentic-update"
+homepage = "https://github.com/greenticai/greentic-update"
+documentation = "https://docs.greentic.ai/update"
+keywords = ["greentic", "updater", "dsse", "in-toto", "signing"]
+categories = ["development-tools"]
+
+[dependencies]
+# Foundation skeleton. Dependencies land with the feature work:
+#   P0a (plan)      -> greentic-distributor-client (signing), serde, serde_json, sha2, hex, chrono, thiserror
+#   P0c (catalogue) -> serde, serde_json
+#   later phases    -> DistClient, rustls/reqwest (mTLS), rcgen, x509-parser, ...
+
+[dev-dependencies]
