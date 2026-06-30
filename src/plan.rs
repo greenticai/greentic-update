@@ -78,13 +78,6 @@ pub struct UpdatePlan {
     pub rollback: RollbackPolicy,
 }
 
-impl UpdatePlan {
-    /// The schema discriminator a valid plan document must carry.
-    pub fn schema_str() -> &'static str {
-        UPDATE_PLAN_SCHEMA_V1
-    }
-}
-
 /// One content-addressed artifact referenced by a plan.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanArtifact {

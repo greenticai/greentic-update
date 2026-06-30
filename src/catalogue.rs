@@ -60,6 +60,14 @@ pub enum ArtifactAction {
     Unchanged,
 }
 
+impl ArtifactAction {
+    /// Whether this action requires fetching the artifact (`Add` or `Update`).
+    /// Single source of truth for the "work needed" concept.
+    pub fn needs_fetch(self) -> bool {
+        matches!(self, ArtifactAction::Add | ArtifactAction::Update)
+    }
+}
+
 /// One planned artifact paired with the action the diff resolved for it, plus
 /// the prior installed entry (for `Update`/`Unchanged`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,16 +93,14 @@ impl WorkList {
     pub fn to_download(&self) -> Vec<&PlanArtifact> {
         self.items
             .iter()
-            .filter(|i| matches!(i.action, ArtifactAction::Add | ArtifactAction::Update))
+            .filter(|i| i.action.needs_fetch())
             .map(|i| &i.planned)
             .collect()
     }
 
     /// Whether any artifact needs fetching (`Add` or `Update`).
     pub fn has_work(&self) -> bool {
-        self.items
-            .iter()
-            .any(|i| matches!(i.action, ArtifactAction::Add | ArtifactAction::Update))
+        self.items.iter().any(|i| i.action.needs_fetch())
     }
 }
 
