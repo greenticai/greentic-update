@@ -13,9 +13,21 @@ keywords = ["greentic", "updater", "dsse", "in-toto", "signing"]
 categories = ["development-tools"]
 
 [dependencies]
-# Foundation skeleton. Dependencies land with the feature work:
-#   P0a (plan)      -> greentic-distributor-client (signing), serde, serde_json, sha2, hex, chrono, thiserror
-#   P0c (catalogue) -> serde, serde_json
-#   later phases    -> DistClient, rustls/reqwest (mTLS), rcgen, x509-parser, ...
+# Only the (ungated) `signing` module is used today (DistClient lands with the
+# download phase). `default-features = false` would be ideal, but
+# distributor-client's `store_auth` module references the optional `dirs_next`
+# crate without a cfg gate, so the minimal build does not compile — see the
+# same note in greentic-operator-trust's Cargo.toml.
+greentic-distributor-client = ">=1.1.0-dev, <1.2.0-0"
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+hex = "0.4"
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
 
 [dev-dependencies]
+# Deterministic Ed25519 test keypairs (PKCS#8 / SPKI PEM) for plan signing tests.
+ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
+serde_json = "1"
