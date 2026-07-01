@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// PEM material needed to build an mTLS-capable HTTP client.
-#[derive(Clone, Debug)]
+///
+/// `Debug` is manually implemented to redact certificate and key material.
+#[derive(Clone)]
 pub struct MtlsConfig {
     /// PEM-encoded CA certificate (trust anchor for the server).
     pub ca_pem: String,
@@ -24,6 +26,16 @@ pub struct MtlsConfig {
     pub client_cert_pem: String,
     /// PEM-encoded client private key (PKCS#8).
     pub client_key_pem: String,
+}
+
+impl std::fmt::Debug for MtlsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MtlsConfig")
+            .field("ca_pem", &"<redacted>")
+            .field("client_cert_pem", &"<redacted>")
+            .field("client_key_pem", &"<REDACTED>")
+            .finish()
+    }
 }
 
 /// Extracted identity fields from a parsed X.509 certificate.
@@ -100,6 +112,8 @@ pub fn preflight_cert(
     crl: Option<&CrlLite>,
 ) -> Result<CertInfo, TlsError> {
     let info = parse_cert_info(cert_pem)?;
+    // Intentionally strict: reject at exact notAfter (1-second conservative
+    // vs RFC 5280 inclusive endpoint). Fail-closed for an update channel.
     if now_epoch >= info.not_after_epoch {
         return Err(TlsError::Expired);
     }
@@ -125,7 +139,7 @@ pub fn build_mtls_client(cfg: &MtlsConfig) -> Result<reqwest::Client, TlsError> 
         .map_err(|e| TlsError::BadPem(format!("client identity: {e}")))?;
     reqwest::Client::builder()
         .use_rustls_tls()
-        .add_root_certificate(ca)
+        .tls_certs_only([ca])
         .identity(identity)
         .build()
         .map_err(|e| TlsError::Build(format!("{e}")))
@@ -402,5 +416,37 @@ mod tests {
         };
         let err = build_mtls_client(&cfg).unwrap_err();
         assert!(matches!(err, TlsError::BadPem(_)));
+    }
+
+    #[test]
+    fn mtls_config_debug_redacts_key_material() {
+        let cfg = MtlsConfig {
+            ca_pem: "SECRET-CA".to_string(),
+            client_cert_pem: "SECRET-CERT".to_string(),
+            client_key_pem: "SECRET-KEY".to_string(),
+        };
+        let dbg = format!("{cfg:?}");
+        assert!(
+            !dbg.contains("SECRET"),
+            "Debug output must not contain key material: {dbg}"
+        );
+        assert!(dbg.contains("<redacted>"));
+        assert!(dbg.contains("<REDACTED>"));
+    }
+
+    #[test]
+    fn preflight_rejects_at_exact_not_after_boundary() {
+        // When now == not_after, the cert is treated as expired (fail-closed).
+        let fx = build_dev_ca_fixture(DEV_CA_SEED, DEV_CLIENT_SEED, "acme", "prod", 9000);
+        let err = preflight_cert(&fx.client_cert_pem, fx.client_not_after_epoch, None).unwrap_err();
+        assert!(matches!(err, TlsError::Expired));
+    }
+
+    #[test]
+    fn preflight_passes_one_second_before_not_after() {
+        let fx = build_dev_ca_fixture(DEV_CA_SEED, DEV_CLIENT_SEED, "acme", "prod", 9001);
+        let info =
+            preflight_cert(&fx.client_cert_pem, fx.client_not_after_epoch - 1, None).unwrap();
+        assert_eq!(info.serial_hex, fx.client_serial_hex);
     }
 }
