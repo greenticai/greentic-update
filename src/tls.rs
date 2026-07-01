@@ -86,8 +86,8 @@ pub fn serial_to_hex(raw: &[u8]) -> String {
     hex::encode(raw)
 }
 
-/// Parse the serial number and `notAfter` from a PEM-encoded X.509
-/// certificate.
+/// Parse identity fields (`serial`, `notBefore`, `notAfter`) from a
+/// PEM-encoded X.509 certificate.
 pub fn parse_cert_info(cert_pem: &str) -> Result<CertInfo, TlsError> {
     let (_, pem) = x509_parser::pem::parse_x509_pem(cert_pem.as_bytes())
         .map_err(|e| TlsError::BadPem(format!("{e}")))?;
@@ -470,7 +470,7 @@ mod tests {
     #[test]
     fn preflight_rejects_not_yet_valid() {
         // Build a cert whose notBefore is 1 day in the future.
-        let (ca_key_pem, ca_kp) = ed25519_keypair_pem(DEV_CA_SEED);
+        let (_ca_key_pem, ca_kp) = ed25519_keypair_pem(DEV_CA_SEED);
 
         let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -503,7 +503,6 @@ mod tests {
 
         let client_cert = client_params.signed_by(&client_kp, &*ca_issuer).unwrap();
         let client_cert_pem = client_cert.pem();
-        let _ = (ca_issuer.pem(), ca_key_pem, client_kp.serialize_pem());
 
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let err = preflight_cert(&client_cert_pem, now, None).unwrap_err();
