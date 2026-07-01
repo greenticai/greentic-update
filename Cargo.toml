@@ -12,6 +12,9 @@ documentation = "https://docs.greentic.ai/update"
 keywords = ["greentic", "updater", "dsse", "in-toto", "signing"]
 categories = ["development-tools"]
 
+[features]
+mtls = ["dep:reqwest", "dep:x509-parser"]
+
 [dependencies]
 # Only the (ungated) `signing` module is used today (DistClient lands with the
 # download phase). `default-features = false` would be ideal, but
@@ -21,13 +24,17 @@ categories = ["development-tools"]
 greentic-distributor-client = ">=1.1.0-dev, <1.2.0-0"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 hex = "0.4"
+reqwest = { version = "0.13", optional = true, default-features = false, features = ["rustls"] }
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
+x509-parser = { version = "0.18", optional = true }
 
 [dev-dependencies]
 # Deterministic Ed25519 test keypairs (PKCS#8 / SPKI PEM) for plan signing tests.
 # `serde_json` is a normal dependency, so tests use it without re-declaring here.
 ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
+rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
+time = "0.3"
