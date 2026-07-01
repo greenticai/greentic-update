@@ -22,3 +22,5 @@ pub mod catalogue;
 pub mod envelope;
 pub mod plan;
 pub mod staging;
+#[cfg(feature = "mtls")]
+pub mod tls;
