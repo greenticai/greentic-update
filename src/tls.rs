@@ -43,6 +43,8 @@ impl std::fmt::Debug for MtlsConfig {
 pub struct CertInfo {
     /// Lowercase hex serial with no separators (e.g. `"00000000000003e8"`).
     pub serial_hex: String,
+    /// `notBefore` as a Unix epoch (seconds).
+    pub not_before_epoch: i64,
     /// `notAfter` as a Unix epoch (seconds).
     pub not_after_epoch: i64,
 }
@@ -64,6 +66,8 @@ pub enum TlsError {
     BadPem(String),
     #[error("invalid X.509 certificate: {0}")]
     InvalidCert(String),
+    #[error("client certificate not yet valid")]
+    NotYetValid,
     #[error("client certificate expired")]
     Expired,
     #[error("client certificate revoked (serial {serial})")]
@@ -90,9 +94,12 @@ pub fn parse_cert_info(cert_pem: &str) -> Result<CertInfo, TlsError> {
     let (_, x509) = x509_parser::parse_x509_certificate(&pem.contents)
         .map_err(|e| TlsError::InvalidCert(format!("{e}")))?;
     let serial_hex = serial_to_hex(x509.tbs_certificate.raw_serial());
-    let not_after_epoch = x509.tbs_certificate.validity().not_after.timestamp();
+    let validity = x509.tbs_certificate.validity();
+    let not_before_epoch = validity.not_before.timestamp();
+    let not_after_epoch = validity.not_after.timestamp();
     Ok(CertInfo {
         serial_hex,
+        not_before_epoch,
         not_after_epoch,
     })
 }
@@ -112,6 +119,10 @@ pub fn preflight_cert(
     crl: Option<&CrlLite>,
 ) -> Result<CertInfo, TlsError> {
     let info = parse_cert_info(cert_pem)?;
+    // Reject not-yet-valid certs (notBefore in the future).
+    if now_epoch < info.not_before_epoch {
+        return Err(TlsError::NotYetValid);
+    }
     // Intentionally strict: reject at exact notAfter (1-second conservative
     // vs RFC 5280 inclusive endpoint). Fail-closed for an update channel.
     if now_epoch >= info.not_after_epoch {
@@ -134,7 +145,13 @@ pub fn preflight_cert(
 pub fn build_mtls_client(cfg: &MtlsConfig) -> Result<reqwest::Client, TlsError> {
     let ca = reqwest::Certificate::from_pem(cfg.ca_pem.as_bytes())
         .map_err(|e| TlsError::BadPem(format!("CA cert: {e}")))?;
-    let identity_pem = format!("{}{}", cfg.client_cert_pem, cfg.client_key_pem);
+    // Ensure a newline separates END CERTIFICATE / BEGIN PRIVATE KEY markers,
+    // even if the cert PEM lacks a trailing newline.
+    let identity_pem = if cfg.client_cert_pem.ends_with('\n') {
+        format!("{}{}", cfg.client_cert_pem, cfg.client_key_pem)
+    } else {
+        format!("{}\n{}", cfg.client_cert_pem, cfg.client_key_pem)
+    };
     let identity = reqwest::Identity::from_pem(identity_pem.as_bytes())
         .map_err(|e| TlsError::BadPem(format!("client identity: {e}")))?;
     reqwest::Client::builder()
@@ -448,5 +465,48 @@ mod tests {
         let info =
             preflight_cert(&fx.client_cert_pem, fx.client_not_after_epoch - 1, None).unwrap();
         assert_eq!(info.serial_hex, fx.client_serial_hex);
+    }
+
+    #[test]
+    fn preflight_rejects_not_yet_valid() {
+        // Build a cert whose notBefore is 1 day in the future.
+        let (ca_key_pem, ca_kp) = ed25519_keypair_pem(DEV_CA_SEED);
+
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "dev-update-ca");
+        ca_params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::CrlSign,
+        ];
+        let ca_issuer = CertifiedIssuer::self_signed(ca_params, ca_kp).unwrap();
+
+        let (_client_key_pem_raw, client_kp) = ed25519_keypair_pem(DEV_CLIENT_SEED);
+
+        let mut client_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        client_params
+            .distinguished_name
+            .push(DnType::CommonName, "dev-future-client");
+        client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        client_params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyEncipherment,
+        ];
+        client_params.serial_number = Some(SerialNumber::from(9002_u64));
+        let not_before = OffsetDateTime::now_utc() + time::Duration::days(1);
+        let not_after = OffsetDateTime::now_utc() + time::Duration::days(365);
+        client_params.not_before = not_before;
+        client_params.not_after = not_after;
+
+        let client_cert = client_params.signed_by(&client_kp, &*ca_issuer).unwrap();
+        let client_cert_pem = client_cert.pem();
+        let _ = (ca_issuer.pem(), ca_key_pem, client_kp.serialize_pem());
+
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let err = preflight_cert(&client_cert_pem, now, None).unwrap_err();
+        assert!(matches!(err, TlsError::NotYetValid));
     }
 }
