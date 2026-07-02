@@ -251,9 +251,14 @@ pub enum StagingError {
         source: tempfile::PersistError,
     },
     /// A path component under the staging root is a pre-existing symlink — a
-    /// write through it could escape the root, so it is refused.
+    /// write or read through it could escape the root, so it is refused.
     #[error("path component `{}` is a symlink (escape risk)", .path.display())]
     SymlinkAncestor { path: PathBuf },
+    /// A staging file that must be read back is not a regular file (a FIFO,
+    /// device, socket, or directory) — reading it could block or return
+    /// non-file bytes, so it is refused before any read.
+    #[error("staging path `{}` is not a regular file", .path.display())]
+    NotRegularFile { path: PathBuf },
     /// Artifacts may only be written while the plan is `Downloading`.
     #[error("cannot add artifacts to plan `{plan_id}` in stage `{stage}` (must be downloading)")]
     ArtifactNotDownloading { plan_id: String, stage: UpdateStage },
@@ -729,6 +734,62 @@ impl StagedPlan {
         read_state(&self.plan_dir)?.ok_or_else(|| self.plan_not_found())
     }
 
+    /// Read the raw bytes of the staged `plan.json` — the DSSE statement body,
+    /// the first input to [`crate::plan::verify_update_plan`]. Callers re-verify
+    /// the signature at apply-time as defense-in-depth: the bytes on disk are
+    /// untrusted even though they were verified when the plan was staged.
+    pub fn plan_bytes(&self) -> Result<Vec<u8>, StagingError> {
+        read_regular_file_in(&self.env_dir, &self.plan_dir.join(PLAN_FILE))
+    }
+
+    /// Read the raw bytes of the staged `plan.json.sig` — the DSSE envelope
+    /// sidecar, the second input to [`crate::plan::verify_update_plan`].
+    pub fn envelope_bytes(&self) -> Result<Vec<u8>, StagingError> {
+        read_regular_file_in(&self.env_dir, &self.plan_dir.join(SIG_FILE))
+    }
+
+    /// The content-addressed blob path for `artifact`
+    /// (`artifacts/sha256-<hex>/blob`). Validates the digest format first, so a
+    /// malformed `artifact.digest` is rejected before any filesystem access.
+    pub fn artifact_blob_path(&self, artifact: &PlanArtifact) -> Result<PathBuf, StagingError> {
+        let (dir_name, _) = digest_dir_name(&artifact.digest)?;
+        Ok(self
+            .plan_dir
+            .join(ARTIFACTS_DIR)
+            .join(dir_name)
+            .join(BLOB_FILE))
+    }
+
+    /// Re-read a staged artifact's blob and re-verify its SHA-256 against
+    /// `artifact.digest`, returning the bytes on match. [`Self::put_artifact`]
+    /// hashes on ingest, but the bytes on disk are untrusted at apply-time —
+    /// this closes the read-side integrity check and fails closed with
+    /// [`StagingError::DigestMismatch`].
+    pub fn verify_artifact_on_disk(
+        &self,
+        artifact: &PlanArtifact,
+    ) -> Result<Vec<u8>, StagingError> {
+        let (dir_name, expected_hex) = digest_dir_name(&artifact.digest)?;
+        let blob = self
+            .plan_dir
+            .join(ARTIFACTS_DIR)
+            .join(dir_name)
+            .join(BLOB_FILE);
+        // The staging tree is untrusted at apply time: refuse a symlinked or
+        // non-regular blob before reading, so the integrity check can't be
+        // tricked into following a symlink out of the tree or blocking on a FIFO.
+        let bytes = read_regular_file_in(&self.env_dir, &blob)?;
+        let actual_hex = crate::plan::sha256_hex(&bytes);
+        if actual_hex != expected_hex {
+            return Err(StagingError::DigestMismatch {
+                name: artifact.name.clone(),
+                expected: artifact.digest.clone(),
+                actual: format!("sha256:{actual_hex}"),
+            });
+        }
+        Ok(bytes)
+    }
+
     /// Verify `bytes` against `artifact.digest`, then write them to
     /// `artifacts/sha256-<hex>/blob`. Content-addressed and idempotent (a
     /// re-download of the same digest overwrites identical bytes). Rejects a
@@ -923,6 +984,29 @@ fn assert_no_symlink_ancestors(root: &Path, target: &Path) -> Result<(), Staging
         }
     }
     Ok(())
+}
+
+/// Read a file under the staging `root`, failing closed if the path is unsafe
+/// to follow. The staging tree is untrusted at read time (apply re-verifies its
+/// contents), so — mirroring the write path's [`assert_no_symlink_ancestors`]
+/// guard — reject a symlink at any path component (an escape) and a non-regular
+/// final file (a FIFO/device/socket/directory would block or return non-file
+/// bytes) *before* `fs::read` follows anything dangerous.
+fn read_regular_file_in(root: &Path, path: &Path) -> Result<Vec<u8>, StagingError> {
+    assert_no_symlink_ancestors(root, path)?;
+    let meta = fs::symlink_metadata(path).map_err(|source| StagingError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !meta.file_type().is_file() {
+        return Err(StagingError::NotRegularFile {
+            path: path.to_path_buf(),
+        });
+    }
+    fs::read(path).map_err(|source| StagingError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 /// Validate a `sha256:<64 hex>` digest, returning its directory name
@@ -1524,6 +1608,184 @@ mod tests {
         assert!(matches!(
             staged.put_artifact(&art, payload),
             Err(StagingError::ArtifactNotDownloading { .. })
+        ));
+    }
+
+    #[test]
+    fn plan_bytes_reads_staged_plan() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        let plan_bytes = br#"{"canonical":"plan"}"#;
+        let staged = root
+            .begin(
+                &verified(plan_with("plan-1", "prod", 1, vec![])),
+                plan_bytes,
+                b"sig",
+            )
+            .unwrap();
+        assert_eq!(staged.plan_bytes().unwrap(), plan_bytes);
+    }
+
+    #[test]
+    fn envelope_bytes_reads_sidecar() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        let sig_bytes = b"dsse-envelope-bytes";
+        let staged = root
+            .begin(
+                &verified(plan_with("plan-1", "prod", 1, vec![])),
+                b"plan",
+                sig_bytes,
+            )
+            .unwrap();
+        assert_eq!(staged.envelope_bytes().unwrap(), sig_bytes);
+    }
+
+    #[test]
+    fn verify_artifact_on_disk_returns_bytes_on_match() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        let payload = b"artifact-payload";
+        let art = artifact("pack-a", payload);
+        let staged = root
+            .begin(
+                &verified(plan_with("plan-1", "prod", 1, vec![art.clone()])),
+                b"p",
+                b"s",
+            )
+            .unwrap();
+        staged.put_artifact(&art, payload).unwrap();
+        assert_eq!(staged.verify_artifact_on_disk(&art).unwrap(), payload);
+    }
+
+    #[test]
+    fn verify_artifact_on_disk_rejects_tampered_blob() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        let payload = b"artifact-payload";
+        let art = artifact("pack-a", payload);
+        let staged = root
+            .begin(
+                &verified(plan_with("plan-1", "prod", 1, vec![art.clone()])),
+                b"p",
+                b"s",
+            )
+            .unwrap();
+        staged.put_artifact(&art, payload).unwrap();
+        // Corrupt the blob after it was hash-verified on ingest: the read-side
+        // check must fail closed.
+        let blob = staged.artifact_blob_path(&art).unwrap();
+        fs::write(&blob, b"tampered-bytes").unwrap();
+        assert!(matches!(
+            staged.verify_artifact_on_disk(&art),
+            Err(StagingError::DigestMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn artifact_blob_path_rejects_malformed_digest() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        let staged = root
+            .begin(
+                &verified(plan_with("plan-1", "prod", 1, vec![])),
+                b"p",
+                b"s",
+            )
+            .unwrap();
+        let bad = PlanArtifact {
+            name: "pack-a".to_string(),
+            version: "1.0.0".to_string(),
+            digest: "sha256:not-hex".to_string(),
+            source: None,
+        };
+        // Both the path builder and the verifier reject before touching disk.
+        assert!(matches!(
+            staged.artifact_blob_path(&bad),
+            Err(StagingError::MalformedDigest { .. })
+        ));
+        assert!(matches!(
+            staged.verify_artifact_on_disk(&bad),
+            Err(StagingError::MalformedDigest { .. })
+        ));
+    }
+
+    #[test]
+    fn verify_artifact_on_disk_rejects_non_regular_blob() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        let payload = b"artifact-payload";
+        let art = artifact("pack-a", payload);
+        let staged = root
+            .begin(
+                &verified(plan_with("plan-1", "prod", 1, vec![art.clone()])),
+                b"p",
+                b"s",
+            )
+            .unwrap();
+        staged.put_artifact(&art, payload).unwrap();
+        // Replace the blob with a directory (a non-regular file): the read must
+        // fail closed before hashing, not block or descend.
+        let blob = staged.artifact_blob_path(&art).unwrap();
+        fs::remove_file(&blob).unwrap();
+        fs::create_dir(&blob).unwrap();
+        assert!(matches!(
+            staged.verify_artifact_on_disk(&art),
+            Err(StagingError::NotRegularFile { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_artifact_on_disk_rejects_symlinked_blob() {
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("secret");
+        fs::write(&target, b"out-of-tree bytes").unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        let payload = b"artifact-payload";
+        let art = artifact("pack-a", payload);
+        let staged = root
+            .begin(
+                &verified(plan_with("plan-1", "prod", 1, vec![art.clone()])),
+                b"p",
+                b"s",
+            )
+            .unwrap();
+        staged.put_artifact(&art, payload).unwrap();
+        // Swap the blob for a symlink pointing OUT of the staging tree: the
+        // verifier must refuse to follow it (not read the escaped file).
+        let blob = staged.artifact_blob_path(&art).unwrap();
+        fs::remove_file(&blob).unwrap();
+        std::os::unix::fs::symlink(&target, &blob).unwrap();
+        assert!(matches!(
+            staged.verify_artifact_on_disk(&art),
+            Err(StagingError::SymlinkAncestor { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_bytes_rejects_symlinked_plan_file() {
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("evil");
+        fs::write(&target, b"not a plan").unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        let staged = root
+            .begin(
+                &verified(plan_with("plan-1", "prod", 1, vec![])),
+                b"plan",
+                b"sig",
+            )
+            .unwrap();
+        // Swap plan.json for a symlink pointing out of the tree.
+        let plan_file = staged.dir().join(PLAN_FILE);
+        fs::remove_file(&plan_file).unwrap();
+        std::os::unix::fs::symlink(&target, &plan_file).unwrap();
+        assert!(matches!(
+            staged.plan_bytes(),
+            Err(StagingError::SymlinkAncestor { .. })
         ));
     }
 
