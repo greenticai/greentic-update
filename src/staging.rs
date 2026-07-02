@@ -510,6 +510,13 @@ impl UpdatesRoot {
         // a concurrent apply that could raise the applied sequence).
         admission(&facts).map_err(BeginApplyError::Rejected)?;
 
+        // Build the returned handle BEFORE committing, so the only fallible step
+        // after the state advances to `Applying` is the accepted commit-then-
+        // audit gap (see `transition_locked`) — never a handle-build failure
+        // (e.g. a corrupt `plan.json`) that would strand the plan at `Applying`
+        // while the caller sees `Err` and cannot retry.
+        let handle = self.staged_handle(plan_dir.clone(), &state)?;
+
         // Commit `Staged → Applying`. The lock is already held, so transition
         // inline rather than through `StagedPlan::transition` (which re-enters
         // it and would trip the non-reentrant flock guard).
@@ -521,7 +528,7 @@ impl UpdatesRoot {
             UpdateStage::Applying,
         )?;
 
-        Ok(self.staged_handle(plan_dir, &state)?)
+        Ok(handle)
     }
 
     /// Reject a plan whose `env_id` does not match this root.
@@ -560,6 +567,17 @@ impl UpdatesRoot {
     /// [`admission_facts_locked`](Self::admission_facts_locked) it relies on the
     /// lock-free strict [`scan_plans`](Self::scan_plans) to avoid re-entering the
     /// non-reentrant flock, and a corrupt marker fails admission closed.
+    ///
+    /// Single-flight and the applied-set both key off a plan's `state.json`
+    /// marker. Per [`scan_plans`](Self::scan_plans)'s contract, a plan-id
+    /// directory with an *absent* marker is treated as a legitimately-incomplete
+    /// `begin` and skipped in both modes — deliberately, so a crashed mid-`begin`
+    /// (dir + `plan.json` written, `state.json` not yet) does not wedge the whole
+    /// env's admission by failing closed forever. The FSM only reaches `Applying`
+    /// or `Applied` *after* writing the marker, so an active plan is always
+    /// visible here; only external deletion of a live marker (outside the staging
+    /// trust model, which defends path/segment integrity, not arbitrary FS
+    /// writes) could hide one.
     fn apply_admission_locked(&self) -> Result<(Option<String>, AdmissionFacts), StagingError> {
         let states = self.scan_plans(true)?;
         let applying = states
@@ -1905,6 +1923,37 @@ mod tests {
         let facts = seen.expect("predicate ran");
         assert_eq!(facts.latest_applied_sequence, Some(5));
         assert_eq!(facts.applied_plan_ids, vec!["old".to_string()]);
+    }
+
+    #[test]
+    fn begin_apply_checked_handle_build_failure_does_not_commit_applying() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        stage_plan(&root, "plan-1", 3);
+
+        // Corrupt plan.json so building the returned handle fails. The handle is
+        // built BEFORE the Staged->Applying commit, so the failure must leave the
+        // plan at Staged — never a half-applied marker that strands it while the
+        // caller only sees Err.
+        let plan_json = tmp.path().join("prod").join("plan-1").join(PLAN_FILE);
+        fs::write(&plan_json, b"{ not json").unwrap();
+
+        let err = root
+            .begin_apply_checked("plan-1", |_facts| Ok::<(), Infallible>(()))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BeginApplyError::Staging(StagingError::State { .. })
+        ));
+
+        // The marker was NOT advanced. `load` would reparse the now-corrupt
+        // plan.json, so read state.json directly.
+        let state_raw =
+            fs::read_to_string(tmp.path().join("prod").join("plan-1").join(STATE_FILE)).unwrap();
+        assert!(
+            state_raw.contains("\"staged\""),
+            "plan must remain Staged when the handle build fails: {state_raw}"
+        );
     }
 
     #[test]
