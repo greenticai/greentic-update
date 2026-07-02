@@ -41,6 +41,8 @@
 //! Operator-identity auditing (who ran the verb) belongs to the caller's audit
 //! ledger; this module records only the mechanical stage transitions.
 
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -255,11 +257,51 @@ pub enum StagingError {
     /// Artifacts may only be written while the plan is `Downloading`.
     #[error("cannot add artifacts to plan `{plan_id}` in stage `{stage}` (must be downloading)")]
     ArtifactNotDownloading { plan_id: String, stage: UpdateStage },
+    /// A strict admission scan (`begin_checked`) found a plan directory whose
+    /// `state.json` is unreadable, corrupt, or names a different plan than its
+    /// directory. Unlike the best-effort [`list`](UpdatesRoot::list), admission
+    /// fails **closed** rather than silently omit a possibly-`Applied` plan from
+    /// the downgrade/compat snapshot.
+    #[error("cannot trust state for plan `{plan_id}` during admission: {reason}")]
+    CorruptAdmissionState { plan_id: String, reason: String },
+    /// The current thread already holds this env's `.lock`. The flock is not
+    /// reentrant, so re-acquiring would deadlock — this is returned instead of
+    /// hanging. It signals a staging method was called from inside a
+    /// [`begin_checked`](UpdatesRoot::begin_checked) admission predicate, which
+    /// already holds the lock; predicates must only read [`AdmissionFacts`].
+    #[error("env lock at {path} re-entered by the same thread (would deadlock)")]
+    LockReentered { path: PathBuf },
+}
+
+/// Error from [`UpdatesRoot::begin_checked`]: either the caller's admission
+/// predicate rejected the plan, or a staging-layer operation failed.
+#[derive(Debug, Error)]
+pub enum BeginCheckedError<E> {
+    /// The admission predicate rejected the plan (e.g. a downgrade or compat
+    /// gate). Carries the caller's own error verbatim.
+    #[error("plan admission rejected: {0}")]
+    Rejected(E),
+    /// A staging-layer failure (lock, IO, `PlanExists`, …).
+    #[error(transparent)]
+    Staging(#[from] StagingError),
 }
 
 // ---------------------------------------------------------------------------
 // UpdatesRoot — the per-environment staging area
 // ---------------------------------------------------------------------------
+
+/// A race-free snapshot of the applied-plan set, handed to a
+/// [`UpdatesRoot::begin_checked`] admission predicate while the env `.lock` is
+/// held — everything a caller needs to run downgrade and compat gates without
+/// racing a concurrent apply.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AdmissionFacts {
+    /// Highest `sequence` among `Applied` plans (`None` if none) — the downgrade
+    /// guard input ([`crate::plan::ensure_not_downgrade`]).
+    pub latest_applied_sequence: Option<u64>,
+    /// `plan_id`s of all `Applied` plans — a compat `requires` input.
+    pub applied_plan_ids: Vec<String>,
+}
 
 /// The staging area for one environment: `<root>/<env_id>/`.
 #[derive(Clone, Debug)]
@@ -310,6 +352,10 @@ impl UpdatesRoot {
     /// the stored `plan.json` + `plan.json.sig` re-verify together at apply time.
     /// Fails with [`StagingError::PlanExists`] if the plan is already staged —
     /// the caller should [`UpdatesRoot::load`] and resume instead.
+    ///
+    /// This admits the plan unconditionally. To run a downgrade/compat check
+    /// atomically with the begin writes (no TOCTOU against a concurrent apply),
+    /// use [`UpdatesRoot::begin_checked`].
     pub fn begin(
         &self,
         verified: &VerifiedUpdatePlan,
@@ -318,12 +364,7 @@ impl UpdatesRoot {
     ) -> Result<StagedPlan, StagingError> {
         let plan = &verified.plan;
         validate_plan_id(&plan.plan_id)?;
-        if plan.env_id != self.env_id {
-            return Err(StagingError::EnvMismatch {
-                plan_env: plan.env_id.clone(),
-                root_env: self.env_id.clone(),
-            });
-        }
+        self.check_targets_env(plan)?;
 
         let _lock = acquire_lock(&self.env_dir)?;
         let plan_dir = self.env_dir.join(&plan.plan_id);
@@ -333,7 +374,98 @@ impl UpdatesRoot {
                 stage: existing.stage,
             });
         }
+        self.write_new_plan(verified, plan_bytes, envelope_bytes, &plan_dir)
+    }
 
+    /// Like [`UpdatesRoot::begin`], but evaluates a caller-supplied `admission`
+    /// predicate **under the same env-lock hold** as the begin writes, closing
+    /// the TOCTOU gap between reading the applied set (for downgrade/compat
+    /// gates) and committing the plan. The predicate receives an
+    /// [`AdmissionFacts`] snapshot — the highest applied `sequence` and the ids
+    /// of every `Applied` plan — computed while the lock is held, so a
+    /// concurrent apply cannot slip a newer sequence in between the check and
+    /// the write.
+    ///
+    /// Return `Ok(())` from `admission` to proceed, or `Err(E)` to reject the
+    /// plan: the rejection surfaces as [`BeginCheckedError::Rejected`] and
+    /// nothing is written. Staging-layer failures surface as
+    /// [`BeginCheckedError::Staging`]. A plan that already exists is rejected
+    /// with `PlanExists` before the predicate runs.
+    pub fn begin_checked<E>(
+        &self,
+        verified: &VerifiedUpdatePlan,
+        plan_bytes: &[u8],
+        envelope_bytes: &[u8],
+        admission: impl FnOnce(&AdmissionFacts) -> Result<(), E>,
+    ) -> Result<StagedPlan, BeginCheckedError<E>> {
+        let plan = &verified.plan;
+        validate_plan_id(&plan.plan_id)?;
+        self.check_targets_env(plan)?;
+
+        let _lock = acquire_lock(&self.env_dir)?;
+        let plan_dir = self.env_dir.join(&plan.plan_id);
+        if let Some(existing) = read_state(&plan_dir)? {
+            return Err(StagingError::PlanExists {
+                plan_id: plan.plan_id.clone(),
+                stage: existing.stage,
+            }
+            .into());
+        }
+
+        // Snapshot the applied set under the held lock, then let the caller gate
+        // on it. `admission_facts_locked` uses the lock-free `scan_plans`, so it
+        // does not re-enter `acquire_lock` (fs4 flock is not reentrant).
+        let facts = self.admission_facts_locked()?;
+        admission(&facts).map_err(BeginCheckedError::Rejected)?;
+
+        self.write_new_plan(verified, plan_bytes, envelope_bytes, &plan_dir)
+            .map_err(BeginCheckedError::Staging)
+    }
+
+    /// Reject a plan whose `env_id` does not match this root.
+    fn check_targets_env(&self, plan: &crate::plan::UpdatePlan) -> Result<(), StagingError> {
+        if plan.env_id != self.env_id {
+            return Err(StagingError::EnvMismatch {
+                plan_env: plan.env_id.clone(),
+                root_env: self.env_id.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// The applied-plan facts an admission predicate needs. **Must be called
+    /// with the env `.lock` held** so the snapshot is race-free against a
+    /// concurrent apply; it relies on the lock-free `scan_plans` (see its doc)
+    /// to avoid re-entering the non-reentrant flock. Uses the **strict** scan:
+    /// a corrupt or directory-mismatched `Applied` marker fails admission closed
+    /// rather than lowering the visible `latest_applied_sequence`.
+    fn admission_facts_locked(&self) -> Result<AdmissionFacts, StagingError> {
+        let applied: Vec<StageState> = self
+            .scan_plans(true)?
+            .into_iter()
+            .filter(|s| s.stage == UpdateStage::Applied)
+            .collect();
+        Ok(AdmissionFacts {
+            latest_applied_sequence: applied.iter().map(|s| s.sequence).max(),
+            applied_plan_ids: applied.into_iter().map(|s| s.plan_id).collect(),
+        })
+    }
+
+    /// Write a brand-new plan's directory, bytes, `Downloading` marker, and
+    /// `begin` audit line. **The caller must hold the env `.lock` and must have
+    /// confirmed the plan does not already exist.** Shared by [`begin`] and
+    /// [`begin_checked`].
+    ///
+    /// [`begin`]: UpdatesRoot::begin
+    /// [`begin_checked`]: UpdatesRoot::begin_checked
+    fn write_new_plan(
+        &self,
+        verified: &VerifiedUpdatePlan,
+        plan_bytes: &[u8],
+        envelope_bytes: &[u8],
+        plan_dir: &Path,
+    ) -> Result<StagedPlan, StagingError> {
+        let plan = &verified.plan;
         let artifacts_dir = plan_dir.join(ARTIFACTS_DIR);
         // Refuse to write through a pre-planted symlink at any component
         // (env/plan/artifacts). Runs under the env lock, immediately before the
@@ -357,7 +489,7 @@ impl UpdatesRoot {
             created_at: now,
             updated_at: now,
         };
-        write_state(&plan_dir, &state)?;
+        write_state(plan_dir, &state)?;
         append_audit(
             &self.env_dir,
             &make_event(
@@ -377,7 +509,7 @@ impl UpdatesRoot {
         Ok(StagedPlan {
             env_dir: self.env_dir.clone(),
             env_id: self.env_id.clone(),
-            plan_dir,
+            plan_dir: plan_dir.to_path_buf(),
             plan: verified.plan.clone(),
             plan_sha256: verified.plan_sha256.clone(),
         })
@@ -409,6 +541,8 @@ impl UpdatesRoot {
     }
 
     /// The `state.json` of every staged plan. Order is filesystem-dependent.
+    /// Best-effort (forgiving) enumeration — see [`scan_plans`] for the
+    /// lock-free contract and the strict admission variant.
     ///
     /// `state.json` is treated as untrusted: an entry is included only if its
     /// directory name is a valid plan id (this also skips `audit/` and `.lock`)
@@ -417,7 +551,25 @@ impl UpdatesRoot {
     /// attacker-controlled `plan_id` can never drive a filesystem path in
     /// [`latest_applied_sequence`](Self::latest_applied_sequence) or
     /// [`apply_retention`](Self::apply_retention).
+    ///
+    /// [`scan_plans`]: Self::scan_plans
     pub fn list(&self) -> Result<Vec<StageState>, StagingError> {
+        self.scan_plans(false)
+    }
+
+    /// Enumerate plan markers under the env dir. Deliberately **does not**
+    /// acquire the env `.lock`, so it can be called by callers that already hold
+    /// it (`apply_retention`, `begin_checked` via `admission_facts_locked`) —
+    /// the flock is not reentrant, so acquiring one here would deadlock them.
+    ///
+    /// With `strict == false` this is the forgiving [`list`](Self::list)
+    /// behavior: a present-but-unreadable, corrupt, or directory-mismatched
+    /// `state.json` is silently skipped. With `strict == true` (admission scans)
+    /// any such marker is a hard [`StagingError::CorruptAdmissionState`], so a
+    /// safety decision never runs against a snapshot that silently dropped a
+    /// possibly-`Applied` plan. An *absent* `state.json` is a legitimately
+    /// incomplete plan and is skipped in both modes.
+    fn scan_plans(&self, strict: bool) -> Result<Vec<StageState>, StagingError> {
         let mut out = Vec::new();
         let entries = match fs::read_dir(&self.env_dir) {
             Ok(entries) => entries,
@@ -440,17 +592,34 @@ impl UpdatesRoot {
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
+            // Non-plan-id dirs (`audit/`, `.lock`, anything unsafe) are
+            // infrastructure, not plans — skipped in both modes.
             if validate_plan_id(&name).is_err() {
                 continue;
             }
-            // Anchor the marker to its directory: ignore a `state.json` whose
-            // `plan_id` disagrees with the directory it lives in (corrupt or
-            // foreign), and swallow per-entry read errors so one bad directory
-            // cannot break enumeration.
-            if let Ok(Some(state)) = read_state(&entry.path())
-                && state.plan_id == name
-            {
-                out.push(state);
+            // Anchor the marker to its directory. An unreadable, corrupt, or
+            // directory-mismatched marker is untrusted: `list()` skips it
+            // (best-effort), but a strict admission scan fails closed rather
+            // than silently omit a possibly-`Applied` plan.
+            match read_state(&entry.path()) {
+                Ok(Some(state)) if state.plan_id == name => out.push(state),
+                Ok(Some(state)) if strict => {
+                    return Err(StagingError::CorruptAdmissionState {
+                        plan_id: name,
+                        reason: format!(
+                            "state.json plan_id `{}` disagrees with its directory",
+                            state.plan_id
+                        ),
+                    });
+                }
+                Err(source) if strict => {
+                    return Err(StagingError::CorruptAdmissionState {
+                        plan_id: name,
+                        reason: format!("state.json is unreadable: {source}"),
+                    });
+                }
+                // Absent marker, or non-strict skip of an untrusted one.
+                Ok(None) | Ok(Some(_)) | Err(_) => {}
             }
         }
         Ok(out)
@@ -838,12 +1007,43 @@ fn fsync_parent(_parent: &Path) -> Result<(), StagingError> {
     Ok(())
 }
 
-/// RAII exclusive lock on `<env_dir>/.lock`. Dropping releases the OS lock.
+thread_local! {
+    /// Env dirs whose `.lock` this thread currently holds. The fs4 flock is per
+    /// open-file-description, so a *second* `acquire_lock` on the same thread
+    /// would block forever waiting on a lock the thread itself already holds. We
+    /// detect that re-entry and fail fast with [`StagingError::LockReentered`].
+    /// Only same-thread re-entry is caught; other threads and processes still
+    /// contend on the OS flock as normal.
+    static HELD_ENV_LOCKS: RefCell<HashSet<PathBuf>> = RefCell::new(HashSet::new());
+}
+
+/// RAII exclusive lock on `<env_dir>/.lock`. Dropping releases the OS lock and
+/// clears this thread's re-entry guard for the env.
 struct Flock {
     _file: File,
+    env_dir: PathBuf,
+}
+
+impl Drop for Flock {
+    fn drop(&mut self) {
+        HELD_ENV_LOCKS.with(|held| {
+            held.borrow_mut().remove(&self.env_dir);
+        });
+        // The `_file` field drops next, releasing the OS flock.
+    }
 }
 
 fn acquire_lock(env_dir: &Path) -> Result<Flock, StagingError> {
+    let key = env_dir.to_path_buf();
+    // Same-thread re-entry would deadlock on the non-reentrant flock — fail fast
+    // rather than hang. Checked (not inserted) here so failed acquisitions below
+    // never leave a stale guard entry; ownership is recorded only once the OS
+    // lock is actually held.
+    if HELD_ENV_LOCKS.with(|held| held.borrow().contains(&key)) {
+        return Err(StagingError::LockReentered {
+            path: env_dir.join(LOCK_FILE),
+        });
+    }
     fs::create_dir_all(env_dir).map_err(|source| StagingError::Io {
         path: env_dir.to_path_buf(),
         source,
@@ -863,7 +1063,13 @@ fn acquire_lock(env_dir: &Path) -> Result<Flock, StagingError> {
         path: lock_path,
         source,
     })?;
-    Ok(Flock { _file: file })
+    HELD_ENV_LOCKS.with(|held| {
+        held.borrow_mut().insert(key.clone());
+    });
+    Ok(Flock {
+        _file: file,
+        env_dir: key,
+    })
 }
 
 fn make_event(
@@ -928,6 +1134,7 @@ fn append_audit(env_dir: &Path, event: &UpdateAuditEvent) -> Result<(), StagingE
 mod tests {
     use super::*;
     use crate::plan::{CompatRequirements, OnFail, RollbackKind, RollbackPolicy, UpdatePlan};
+    use std::convert::Infallible;
     use tempfile::TempDir;
 
     fn digest_of(bytes: &[u8]) -> String {
@@ -1087,6 +1294,178 @@ mod tests {
         assert!(matches!(
             root.begin(&wrong, b"p", b"s"),
             Err(StagingError::EnvMismatch { .. })
+        ));
+    }
+
+    // Drive a freshly-begun plan all the way to `Applied` (for admission tests).
+    fn apply_plan(root: &UpdatesRoot, plan_id: &str, sequence: u64) {
+        let staged = root
+            .begin(
+                &verified(plan_with(plan_id, "prod", sequence, vec![])),
+                b"p",
+                b"s",
+            )
+            .unwrap();
+        staged.transition(UpdateStage::Inbox).unwrap();
+        staged.transition(UpdateStage::Staged).unwrap();
+        staged.transition(UpdateStage::Applying).unwrap();
+        staged.transition(UpdateStage::Applied).unwrap();
+    }
+
+    #[test]
+    fn begin_checked_admits_when_predicate_accepts() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        let plan = plan_with("plan-1", "prod", 3, vec![]);
+        let plan_bytes = serde_json::to_vec(&plan).unwrap();
+        let v = verified(plan);
+
+        let staged = root
+            .begin_checked(&v, &plan_bytes, b"s", |_facts| Ok::<(), Infallible>(()))
+            .unwrap();
+
+        // Identical outcome to `begin`: admitted at `Downloading`, loadable.
+        assert_eq!(staged.stage().unwrap(), UpdateStage::Downloading);
+        assert_eq!(
+            root.load("plan-1").unwrap().unwrap().stage().unwrap(),
+            UpdateStage::Downloading
+        );
+    }
+
+    #[test]
+    fn begin_checked_rejection_writes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        let v = verified(plan_with("plan-1", "prod", 3, vec![]));
+
+        let err = root
+            .begin_checked(&v, b"p", b"s", |_facts| Err::<(), &str>("nope"))
+            .unwrap_err();
+
+        assert!(matches!(err, BeginCheckedError::Rejected("nope")));
+        // A rejected plan leaves nothing half-staged.
+        assert!(root.load("plan-1").unwrap().is_none());
+        assert!(!tmp.path().join("prod").join("plan-1").exists());
+    }
+
+    #[test]
+    fn begin_checked_snapshots_applied_set_under_lock() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        apply_plan(&root, "old", 5);
+
+        // The predicate must see the applied set (seq 5, id "old"), proving the
+        // downgrade/compat inputs are read atomically with the begin writes.
+        let mut seen: Option<AdmissionFacts> = None;
+        root.begin_checked(
+            &verified(plan_with("new", "prod", 6, vec![])),
+            b"p",
+            b"s",
+            |facts| {
+                seen = Some(facts.clone());
+                Ok::<(), Infallible>(())
+            },
+        )
+        .unwrap();
+
+        let facts = seen.expect("predicate ran");
+        assert_eq!(facts.latest_applied_sequence, Some(5));
+        assert_eq!(facts.applied_plan_ids, vec!["old".to_string()]);
+    }
+
+    #[test]
+    fn begin_checked_downgrade_gate_composes_with_ensure_not_downgrade() {
+        // The intended caller shape: reject a plan whose sequence is not newer
+        // than the highest applied sequence — inside the lock, no TOCTOU.
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        apply_plan(&root, "old", 5);
+
+        let stale = verified(plan_with("stale", "prod", 5, vec![]));
+        let err = root
+            .begin_checked(&stale, b"p", b"s", |facts| {
+                crate::plan::ensure_not_downgrade(&stale.plan, facts.latest_applied_sequence)
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            BeginCheckedError::Rejected(crate::plan::PlanError::Downgrade { plan: 5, last: 5 })
+        ));
+        assert!(root.load("stale").unwrap().is_none());
+    }
+
+    #[test]
+    fn begin_checked_rejects_duplicate_before_predicate() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        let v = verified(plan_with("plan-1", "prod", 1, vec![]));
+        root.begin(&v, b"p", b"s").unwrap();
+
+        let mut called = false;
+        let err = root
+            .begin_checked(&v, b"p", b"s", |_facts| {
+                called = true;
+                Ok::<(), Infallible>(())
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            BeginCheckedError::Staging(StagingError::PlanExists { .. })
+        ));
+        assert!(!called, "predicate must not run for an already-staged plan");
+    }
+
+    #[test]
+    fn begin_checked_fails_closed_on_corrupt_applied_marker() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        apply_plan(&root, "old", 5);
+
+        // Corrupt the applied plan's marker (disk corruption / local tamper).
+        let marker = tmp.path().join("prod").join("old").join(STATE_FILE);
+        fs::write(&marker, b"{ not valid json").unwrap();
+
+        // Admission must fail CLOSED — not silently drop `old` (lowering the
+        // visible latest sequence) and admit a stale plan.
+        let err = root
+            .begin_checked(
+                &verified(plan_with("new", "prod", 6, vec![])),
+                b"p",
+                b"s",
+                |_facts| Ok::<(), Infallible>(()),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BeginCheckedError::Staging(StagingError::CorruptAdmissionState { .. })
+        ));
+        // The best-effort `list()` still tolerates the corrupt marker.
+        assert!(root.list().is_ok());
+    }
+
+    #[test]
+    fn begin_checked_predicate_reentering_lock_fails_fast_not_deadlock() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+
+        // A predicate that misuses the API by calling a locking method while the
+        // env lock is held must get `LockReentered` — never hang.
+        let err = root
+            .begin_checked(
+                &verified(plan_with("plan-1", "prod", 1, vec![])),
+                b"p",
+                b"s",
+                |_facts| {
+                    root.apply_retention(&RetentionPolicy { keep_terminal: 1 })
+                        .map(|_| ())
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BeginCheckedError::Rejected(StagingError::LockReentered { .. })
         ));
     }
 
