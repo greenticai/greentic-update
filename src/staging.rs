@@ -50,7 +50,6 @@ use chrono::{DateTime, Utc};
 use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::plan::{PlanArtifact, VerifiedUpdatePlan};
@@ -281,13 +280,13 @@ impl UpdatesRoot {
     pub fn open_in(root: &Path, env_id: &str) -> Result<Self, StagingError> {
         safe_segment(env_id, "env_id")?;
         let env_dir = root.join(env_id);
+        // Guard before the mutation (consistent with begin/put_artifact/retention):
+        // refuse if `env_id` resolves through a pre-existing symlink.
+        assert_no_symlink_ancestors(root, &env_dir)?;
         fs::create_dir_all(&env_dir).map_err(|source| StagingError::Io {
             path: env_dir.clone(),
             source,
         })?;
-        if let Some(parent) = env_dir.parent() {
-            assert_no_symlink_ancestors(parent, &env_dir)?;
-        }
         Ok(Self {
             env_dir,
             env_id: env_id.to_string(),
@@ -508,11 +507,7 @@ impl UpdatesRoot {
             )?;
             evicted.push(state.plan_id);
         }
-        Ok(RetentionReport {
-            scanned,
-            evicted_count: evicted.len(),
-            evicted,
-        })
+        Ok(RetentionReport { scanned, evicted })
     }
 }
 
@@ -531,6 +526,15 @@ pub struct StagedPlan {
 }
 
 impl StagedPlan {
+    /// The `PlanNotFound` error for this handle, shared by the state readers,
+    /// `put_artifact`, and `transition`.
+    fn plan_not_found(&self) -> StagingError {
+        StagingError::PlanNotFound {
+            plan_id: self.plan.plan_id.clone(),
+            env_id: self.env_id.clone(),
+        }
+    }
+
     /// The verified plan document.
     pub fn plan(&self) -> &crate::plan::UpdatePlan {
         &self.plan
@@ -553,10 +557,7 @@ impl StagedPlan {
 
     /// Read the current on-disk `state.json`.
     pub fn state(&self) -> Result<StageState, StagingError> {
-        read_state(&self.plan_dir)?.ok_or_else(|| StagingError::PlanNotFound {
-            plan_id: self.plan.plan_id.clone(),
-            env_id: self.env_id.clone(),
-        })
+        read_state(&self.plan_dir)?.ok_or_else(|| self.plan_not_found())
     }
 
     /// Verify `bytes` against `artifact.digest`, then write them to
@@ -570,13 +571,8 @@ impl StagedPlan {
         artifact: &PlanArtifact,
         bytes: &[u8],
     ) -> Result<PathBuf, StagingError> {
-        let dir_name = digest_dir_name(&artifact.digest)?;
-        let expected_hex = artifact
-            .digest
-            .strip_prefix("sha256:")
-            .expect("digest_dir_name validated the prefix")
-            .to_ascii_lowercase();
-        let actual_hex = hex::encode(Sha256::digest(bytes));
+        let (dir_name, expected_hex) = digest_dir_name(&artifact.digest)?;
+        let actual_hex = crate::plan::sha256_hex(bytes);
         if actual_hex != expected_hex {
             return Err(StagingError::DigestMismatch {
                 name: artifact.name.clone(),
@@ -588,10 +584,7 @@ impl StagedPlan {
         // that has already left `Downloading`.
         let _lock = acquire_lock(&self.env_dir)?;
         let stage = read_state(&self.plan_dir)?
-            .ok_or_else(|| StagingError::PlanNotFound {
-                plan_id: self.plan.plan_id.clone(),
-                env_id: self.env_id.clone(),
-            })?
+            .ok_or_else(|| self.plan_not_found())?
             .stage;
         if stage != UpdateStage::Downloading {
             return Err(StagingError::ArtifactNotDownloading {
@@ -614,10 +607,7 @@ impl StagedPlan {
     /// per-env `.lock`. Returns the new state.
     pub fn transition(&self, to: UpdateStage) -> Result<StageState, StagingError> {
         let _lock = acquire_lock(&self.env_dir)?;
-        let mut state = read_state(&self.plan_dir)?.ok_or_else(|| StagingError::PlanNotFound {
-            plan_id: self.plan.plan_id.clone(),
-            env_id: self.env_id.clone(),
-        })?;
+        let mut state = read_state(&self.plan_dir)?.ok_or_else(|| self.plan_not_found())?;
         let from = state.stage;
         if !is_valid_transition(from, to) {
             return Err(StagingError::InvalidTransition {
@@ -669,10 +659,8 @@ pub struct RetentionPolicy {
 pub struct RetentionReport {
     /// Total plan directories scanned.
     pub scanned: usize,
-    /// Ids of evicted plans.
+    /// Ids of evicted plans (count via `evicted.len()`).
     pub evicted: Vec<String>,
-    /// Number evicted (== `evicted.len()`).
-    pub evicted_count: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -768,16 +756,18 @@ fn assert_no_symlink_ancestors(root: &Path, target: &Path) -> Result<(), Staging
     Ok(())
 }
 
-/// Validate a `sha256:<64 hex>` digest and derive its directory name
-/// (`sha256-<lowercase hex>`).
-fn digest_dir_name(digest: &str) -> Result<String, StagingError> {
+/// Validate a `sha256:<64 hex>` digest, returning its directory name
+/// (`sha256-<lowercase hex>`) and the validated lowercase hex — so callers that
+/// need both parse the digest once.
+fn digest_dir_name(digest: &str) -> Result<(String, String), StagingError> {
     let hex = digest
         .strip_prefix("sha256:")
         .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
         .ok_or_else(|| StagingError::MalformedDigest {
             digest: digest.to_string(),
-        })?;
-    Ok(format!("sha256-{}", hex.to_ascii_lowercase()))
+        })?
+        .to_ascii_lowercase();
+    Ok((format!("sha256-{hex}"), hex))
 }
 
 fn read_state(plan_dir: &Path) -> Result<Option<StageState>, StagingError> {
@@ -941,7 +931,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn digest_of(bytes: &[u8]) -> String {
-        format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
+        format!("sha256:{}", crate::plan::sha256_hex(bytes))
     }
 
     fn plan_with(
@@ -1380,7 +1370,7 @@ mod tests {
             .apply_retention(&RetentionPolicy { keep_terminal: 1 })
             .unwrap();
         assert_eq!(report.scanned, 4);
-        assert_eq!(report.evicted_count, 2, "3 terminal, keep 1 => evict 2");
+        assert_eq!(report.evicted.len(), 2, "3 terminal, keep 1 => evict 2");
 
         // The active plan and exactly one terminal plan survive.
         let survivors: Vec<String> = root
@@ -1398,12 +1388,12 @@ mod tests {
         let hex = "a".repeat(64);
         assert_eq!(
             digest_dir_name(&format!("sha256:{hex}")).unwrap(),
-            format!("sha256-{hex}")
+            (format!("sha256-{hex}"), hex.clone())
         );
         // Uppercase hex is normalized to lowercase.
         assert_eq!(
             digest_dir_name(&format!("sha256:{}", "A".repeat(64))).unwrap(),
-            format!("sha256-{}", "a".repeat(64))
+            (format!("sha256-{}", "a".repeat(64)), "a".repeat(64))
         );
         for bad in [
             "sha256:short",
