@@ -291,6 +291,26 @@ pub enum BeginCheckedError<E> {
     Staging(#[from] StagingError),
 }
 
+/// Error from [`UpdatesRoot::begin_apply_checked`]: the caller's admission
+/// predicate rejected the plan, another plan is already applying (the
+/// single-flight gate), or a staging-layer operation failed.
+#[derive(Debug, Error)]
+pub enum BeginApplyError<E> {
+    /// The admission predicate rejected the plan (e.g. an apply-time downgrade
+    /// or compat gate). Carries the caller's own error verbatim.
+    #[error("apply admission rejected: {0}")]
+    Rejected(E),
+    /// Another plan in this environment is already in [`UpdateStage::Applying`].
+    /// At most one apply may be in flight per env; the caller should retry once
+    /// the in-flight apply reaches a terminal stage.
+    #[error("plan `{applying}` is already applying in env `{env_id}`")]
+    AlreadyApplying { env_id: String, applying: String },
+    /// A staging-layer failure (lock, IO, `PlanNotFound`, `InvalidTransition`,
+    /// `CorruptAdmissionState`, …).
+    #[error(transparent)]
+    Staging(#[from] StagingError),
+}
+
 // ---------------------------------------------------------------------------
 // UpdatesRoot — the per-environment staging area
 // ---------------------------------------------------------------------------
@@ -427,6 +447,90 @@ impl UpdatesRoot {
             .map_err(BeginCheckedError::Staging)
     }
 
+    /// Atomically admit a **staged** plan into [`UpdateStage::Applying`] under
+    /// one env-lock hold — the apply-time analogue of [`begin_checked`]. This is
+    /// the single-flight gate that closes the concurrent-apply TOCTOU: with the
+    /// lock held it (1) confirms the target plan is still `Staged`, (2) rejects
+    /// with [`BeginApplyError::AlreadyApplying`] if any *other* plan in this env
+    /// is already `Applying`, (3) runs the caller's `admission` predicate against
+    /// a race-free [`AdmissionFacts`] snapshot (the same downgrade/compat inputs
+    /// [`begin_checked`] gets), and only then (4) commits `Staged → Applying`.
+    ///
+    /// The predicate must not call a *locking* staging method — it runs while
+    /// the env lock is held, so doing so surfaces as [`BeginApplyError::Staging`]
+    /// with [`StagingError::LockReentered`] rather than a deadlock. The lock-free
+    /// reads on a [`StagedPlan`] handle (`plan_bytes`, `envelope_bytes`,
+    /// `verify_artifact_on_disk`) are safe to call from the predicate for
+    /// apply-time re-verification.
+    ///
+    /// On any rejection nothing is written and the plan stays `Staged`. A
+    /// non-`Staged` target is [`StagingError::InvalidTransition`]; a missing one
+    /// is [`StagingError::PlanNotFound`] (both via [`BeginApplyError::Staging`]).
+    /// The returned handle is at `Applying`; the caller drives it on to `Applied`
+    /// or `Failed`.
+    ///
+    /// [`begin_checked`]: UpdatesRoot::begin_checked
+    pub fn begin_apply_checked<E>(
+        &self,
+        plan_id: &str,
+        admission: impl FnOnce(&AdmissionFacts) -> Result<(), E>,
+    ) -> Result<StagedPlan, BeginApplyError<E>> {
+        validate_plan_id(plan_id)?;
+
+        let _lock = acquire_lock(&self.env_dir)?;
+        let plan_dir = self.env_dir.join(plan_id);
+
+        // The target must exist and still be `Staged` — re-read under the lock so
+        // a transition that landed since the caller's `load` cannot be applied
+        // over.
+        let state = read_state(&plan_dir)?.ok_or_else(|| StagingError::PlanNotFound {
+            plan_id: plan_id.to_string(),
+            env_id: self.env_id.clone(),
+        })?;
+        if state.stage != UpdateStage::Staged {
+            return Err(StagingError::InvalidTransition {
+                plan_id: plan_id.to_string(),
+                from: state.stage,
+                to: UpdateStage::Applying,
+            }
+            .into());
+        }
+
+        // Single-flight: at most one plan may be `Applying` per env. The target
+        // is `Staged` (checked above), so any `Applying` plan is another one.
+        let (applying, facts) = self.apply_admission_locked()?;
+        if let Some(applying) = applying {
+            return Err(BeginApplyError::AlreadyApplying {
+                env_id: self.env_id.clone(),
+                applying,
+            });
+        }
+
+        // Downgrade/compat gate, atomic with the commit below (no TOCTOU against
+        // a concurrent apply that could raise the applied sequence).
+        admission(&facts).map_err(BeginApplyError::Rejected)?;
+
+        // Build the returned handle BEFORE committing, so the only fallible step
+        // after the state advances to `Applying` is the accepted commit-then-
+        // audit gap (see `transition_locked`) — never a handle-build failure
+        // (e.g. a corrupt `plan.json`) that would strand the plan at `Applying`
+        // while the caller sees `Err` and cannot retry.
+        let handle = self.staged_handle(plan_dir.clone(), &state)?;
+
+        // Commit `Staged → Applying`. The lock is already held, so transition
+        // inline rather than through `StagedPlan::transition` (which re-enters
+        // it and would trip the non-reentrant flock guard).
+        transition_locked(
+            &self.env_dir,
+            &self.env_id,
+            plan_id,
+            &plan_dir,
+            UpdateStage::Applying,
+        )?;
+
+        Ok(handle)
+    }
+
     /// Reject a plan whose `env_id` does not match this root.
     fn check_targets_env(&self, plan: &crate::plan::UpdatePlan) -> Result<(), StagingError> {
         if plan.env_id != self.env_id {
@@ -454,6 +558,41 @@ impl UpdatesRoot {
             latest_applied_sequence: applied.iter().map(|s| s.sequence).max(),
             applied_plan_ids: applied.into_iter().map(|s| s.plan_id).collect(),
         })
+    }
+
+    /// The apply-admission inputs, from a single strict scan under the held env
+    /// `.lock`: the id of a plan already in [`UpdateStage::Applying`] (the
+    /// single-flight input) and the applied-set [`AdmissionFacts`] the caller's
+    /// downgrade/compat predicate needs. Like
+    /// [`admission_facts_locked`](Self::admission_facts_locked) it relies on the
+    /// lock-free strict [`scan_plans`](Self::scan_plans) to avoid re-entering the
+    /// non-reentrant flock, and a corrupt marker fails admission closed.
+    ///
+    /// Single-flight and the applied-set both key off a plan's `state.json`
+    /// marker. Per [`scan_plans`](Self::scan_plans)'s contract, a plan-id
+    /// directory with an *absent* marker is treated as a legitimately-incomplete
+    /// `begin` and skipped in both modes — deliberately, so a crashed mid-`begin`
+    /// (dir + `plan.json` written, `state.json` not yet) does not wedge the whole
+    /// env's admission by failing closed forever. The FSM only reaches `Applying`
+    /// or `Applied` *after* writing the marker, so an active plan is always
+    /// visible here; only external deletion of a live marker (outside the staging
+    /// trust model, which defends path/segment integrity, not arbitrary FS
+    /// writes) could hide one.
+    fn apply_admission_locked(&self) -> Result<(Option<String>, AdmissionFacts), StagingError> {
+        let states = self.scan_plans(true)?;
+        let applying = states
+            .iter()
+            .find(|s| s.stage == UpdateStage::Applying)
+            .map(|s| s.plan_id.clone());
+        let applied: Vec<&StageState> = states
+            .iter()
+            .filter(|s| s.stage == UpdateStage::Applied)
+            .collect();
+        let facts = AdmissionFacts {
+            latest_applied_sequence: applied.iter().map(|s| s.sequence).max(),
+            applied_plan_ids: applied.iter().map(|s| s.plan_id.clone()).collect(),
+        };
+        Ok((applying, facts))
     }
 
     /// Write a brand-new plan's directory, bytes, `Downloading` marker, and
@@ -527,6 +666,19 @@ impl UpdatesRoot {
         let Some(state) = read_state(&plan_dir)? else {
             return Ok(None);
         };
+        Ok(Some(self.staged_handle(plan_dir, &state)?))
+    }
+
+    /// Build a [`StagedPlan`] handle for `plan_dir` from an already-read `state`,
+    /// reparsing `plan.json` from disk. Does **not** acquire the env `.lock`, so
+    /// it is safe to call from a context that already holds it (e.g.
+    /// [`begin_apply_checked`](Self::begin_apply_checked)). Shared with
+    /// [`load`](Self::load).
+    fn staged_handle(
+        &self,
+        plan_dir: PathBuf,
+        state: &StageState,
+    ) -> Result<StagedPlan, StagingError> {
         let plan_path = plan_dir.join(PLAN_FILE);
         let plan_bytes = fs::read(&plan_path).map_err(|source| StagingError::Io {
             path: plan_path.clone(),
@@ -536,13 +688,13 @@ impl UpdatesRoot {
             path: plan_path,
             source,
         })?;
-        Ok(Some(StagedPlan {
+        Ok(StagedPlan {
             env_dir: self.env_dir.clone(),
             env_id: self.env_id.clone(),
             plan_dir,
             plan,
-            plan_sha256: state.plan_sha256,
-        }))
+            plan_sha256: state.plan_sha256.clone(),
+        })
     }
 
     /// The `state.json` of every staged plan. Order is filesystem-dependent.
@@ -837,39 +989,64 @@ impl StagedPlan {
     /// per-env `.lock`. Returns the new state.
     pub fn transition(&self, to: UpdateStage) -> Result<StageState, StagingError> {
         let _lock = acquire_lock(&self.env_dir)?;
-        let mut state = read_state(&self.plan_dir)?.ok_or_else(|| self.plan_not_found())?;
-        let from = state.stage;
-        if !is_valid_transition(from, to) {
-            return Err(StagingError::InvalidTransition {
-                plan_id: self.plan.plan_id.clone(),
-                from,
-                to,
-            });
-        }
-        state.stage = to;
-        state.updated_at = Utc::now();
-        assert_no_symlink_ancestors(&self.env_dir, &self.plan_dir.join(STATE_FILE))?;
-        write_state(&self.plan_dir, &state)?;
-        // State is committed before the audit line: if the append or its fsync
-        // fails, the transition is already durable and this returns Err (a retry
-        // then hits InvalidTransition). This is the same commit-then-audit gap
-        // the deployer's `audit_and_record` documents and accepts — the on-disk
-        // backend has no cross-file transaction, and the stage marker is the
-        // source of truth. A crash in this window likewise leaves a committed
-        // transition with no audit line.
-        append_audit(
+        transition_locked(
             &self.env_dir,
-            &make_event(
-                &self.env_id,
-                &self.plan.plan_id,
-                to.as_str(),
-                Some(from),
-                Some(to),
-                Value::Null,
-            ),
-        )?;
-        Ok(state)
+            &self.env_id,
+            &self.plan.plan_id,
+            &self.plan_dir,
+            to,
+        )
     }
+}
+
+/// Commit a `from → to` stage transition for the plan at `plan_dir`, **assuming
+/// the env `.lock` is already held**. Gated by [`is_valid_transition`]; rewrites
+/// `state.json` atomically, then appends the audit line. Shared by
+/// [`StagedPlan::transition`] (which acquires the lock first) and
+/// [`UpdatesRoot::begin_apply_checked`] (which holds it across the admission
+/// predicate, so it cannot re-acquire the non-reentrant flock).
+fn transition_locked(
+    env_dir: &Path,
+    env_id: &str,
+    plan_id: &str,
+    plan_dir: &Path,
+    to: UpdateStage,
+) -> Result<StageState, StagingError> {
+    let mut state = read_state(plan_dir)?.ok_or_else(|| StagingError::PlanNotFound {
+        plan_id: plan_id.to_string(),
+        env_id: env_id.to_string(),
+    })?;
+    let from = state.stage;
+    if !is_valid_transition(from, to) {
+        return Err(StagingError::InvalidTransition {
+            plan_id: plan_id.to_string(),
+            from,
+            to,
+        });
+    }
+    state.stage = to;
+    state.updated_at = Utc::now();
+    assert_no_symlink_ancestors(env_dir, &plan_dir.join(STATE_FILE))?;
+    write_state(plan_dir, &state)?;
+    // State is committed before the audit line: if the append or its fsync
+    // fails, the transition is already durable and this returns Err (a retry
+    // then hits InvalidTransition). This is the same commit-then-audit gap the
+    // deployer's `audit_and_record` documents and accepts — the on-disk backend
+    // has no cross-file transaction, and the stage marker is the source of
+    // truth. A crash in this window likewise leaves a committed transition with
+    // no audit line.
+    append_audit(
+        env_dir,
+        &make_event(
+            env_id,
+            plan_id,
+            to.as_str(),
+            Some(from),
+            Some(to),
+            Value::Null,
+        ),
+    )?;
+    Ok(state)
 }
 
 // ---------------------------------------------------------------------------
@@ -1396,6 +1573,18 @@ mod tests {
         staged.transition(UpdateStage::Applied).unwrap();
     }
 
+    // Begin a plan and drive it to `Staged` — ready for apply admission. Writes
+    // the canonical plan JSON as the plan bytes so the handle `begin_apply_checked`
+    // rebuilds (which reparses `plan.json`) round-trips.
+    fn stage_plan(root: &UpdatesRoot, plan_id: &str, sequence: u64) -> StagedPlan {
+        let plan = plan_with(plan_id, "prod", sequence, vec![]);
+        let plan_bytes = serde_json::to_vec(&plan).unwrap();
+        let staged = root.begin(&verified(plan), &plan_bytes, b"s").unwrap();
+        staged.transition(UpdateStage::Inbox).unwrap();
+        staged.transition(UpdateStage::Staged).unwrap();
+        staged
+    }
+
     #[test]
     fn begin_checked_admits_when_predicate_accepts() {
         let tmp = TempDir::new().unwrap();
@@ -1551,6 +1740,237 @@ mod tests {
             err,
             BeginCheckedError::Rejected(StagingError::LockReentered { .. })
         ));
+    }
+
+    #[test]
+    fn begin_apply_checked_admits_staged_with_no_other_applying() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        stage_plan(&root, "plan-1", 3);
+
+        let staged = root
+            .begin_apply_checked("plan-1", |_facts| Ok::<(), Infallible>(()))
+            .unwrap();
+
+        // The returned handle — and the on-disk marker — are now `Applying`.
+        assert_eq!(staged.stage().unwrap(), UpdateStage::Applying);
+        assert_eq!(
+            root.load("plan-1").unwrap().unwrap().stage().unwrap(),
+            UpdateStage::Applying
+        );
+    }
+
+    #[test]
+    fn begin_apply_checked_rejects_when_another_plan_applying() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        // One plan already in flight.
+        stage_plan(&root, "in-flight", 4)
+            .transition(UpdateStage::Applying)
+            .unwrap();
+        // A second, staged plan cannot begin applying while the first is Applying.
+        stage_plan(&root, "waiting", 5);
+
+        let mut called = false;
+        let err = root
+            .begin_apply_checked("waiting", |_facts| {
+                called = true;
+                Ok::<(), Infallible>(())
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            BeginApplyError::AlreadyApplying { ref applying, .. } if applying == "in-flight"
+        ));
+        assert!(!called, "single-flight rejects before the predicate runs");
+        // The waiting plan is untouched — still Staged.
+        assert_eq!(
+            root.load("waiting").unwrap().unwrap().stage().unwrap(),
+            UpdateStage::Staged
+        );
+    }
+
+    #[test]
+    fn begin_apply_checked_rejection_leaves_plan_staged() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        stage_plan(&root, "plan-1", 3);
+
+        let err = root
+            .begin_apply_checked("plan-1", |_facts| Err::<(), &str>("nope"))
+            .unwrap_err();
+
+        assert!(matches!(err, BeginApplyError::Rejected("nope")));
+        // A rejected apply does not transition the plan out of Staged.
+        assert_eq!(
+            root.load("plan-1").unwrap().unwrap().stage().unwrap(),
+            UpdateStage::Staged
+        );
+    }
+
+    #[test]
+    fn begin_apply_checked_rejects_non_staged_target() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+
+        // Downloading (fresh begin) is not applyable.
+        root.begin(&verified(plan_with("fresh", "prod", 1, vec![])), b"p", b"s")
+            .unwrap();
+        let err = root
+            .begin_apply_checked("fresh", |_facts| Ok::<(), Infallible>(()))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BeginApplyError::Staging(StagingError::InvalidTransition {
+                from: UpdateStage::Downloading,
+                to: UpdateStage::Applying,
+                ..
+            })
+        ));
+
+        // An already-applied (terminal) plan is likewise refused.
+        apply_plan(&root, "done", 2);
+        let err = root
+            .begin_apply_checked("done", |_facts| Ok::<(), Infallible>(()))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BeginApplyError::Staging(StagingError::InvalidTransition {
+                from: UpdateStage::Applied,
+                to: UpdateStage::Applying,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn begin_apply_checked_plan_not_found() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        let err = root
+            .begin_apply_checked("ghost", |_facts| Ok::<(), Infallible>(()))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BeginApplyError::Staging(StagingError::PlanNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn begin_apply_checked_fails_closed_on_corrupt_marker() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        apply_plan(&root, "old", 5);
+        stage_plan(&root, "new", 6);
+
+        // Corrupt an *other* plan's marker: the strict apply-admission scan must
+        // fail closed rather than silently drop a possibly-Applied plan.
+        let marker = tmp.path().join("prod").join("old").join(STATE_FILE);
+        fs::write(&marker, b"{ not valid json").unwrap();
+
+        let err = root
+            .begin_apply_checked("new", |_facts| Ok::<(), Infallible>(()))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BeginApplyError::Staging(StagingError::CorruptAdmissionState { .. })
+        ));
+        // The target plan is not transitioned when admission fails closed.
+        assert_eq!(
+            root.load("new").unwrap().unwrap().stage().unwrap(),
+            UpdateStage::Staged
+        );
+    }
+
+    #[test]
+    fn begin_apply_checked_predicate_runs_under_lock() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        stage_plan(&root, "plan-1", 3);
+
+        // A predicate that misuses the API by calling a *locking* method while
+        // the env lock is held must get `LockReentered` — proving the predicate
+        // runs under the same lock hold as the commit (never a deadlock).
+        let err = root
+            .begin_apply_checked("plan-1", |_facts| {
+                root.apply_retention(&RetentionPolicy { keep_terminal: 1 })
+                    .map(|_| ())
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BeginApplyError::Rejected(StagingError::LockReentered { .. })
+        ));
+    }
+
+    #[test]
+    fn begin_apply_checked_snapshots_applied_set() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        apply_plan(&root, "old", 5);
+        stage_plan(&root, "new", 6);
+
+        // The predicate sees the applied set atomically (seq 5, id "old") — the
+        // downgrade/compat inputs, read under the same lock as the commit.
+        let mut seen: Option<AdmissionFacts> = None;
+        root.begin_apply_checked("new", |facts| {
+            seen = Some(facts.clone());
+            Ok::<(), Infallible>(())
+        })
+        .unwrap();
+
+        let facts = seen.expect("predicate ran");
+        assert_eq!(facts.latest_applied_sequence, Some(5));
+        assert_eq!(facts.applied_plan_ids, vec!["old".to_string()]);
+    }
+
+    #[test]
+    fn begin_apply_checked_handle_build_failure_does_not_commit_applying() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        stage_plan(&root, "plan-1", 3);
+
+        // Corrupt plan.json so building the returned handle fails. The handle is
+        // built BEFORE the Staged->Applying commit, so the failure must leave the
+        // plan at Staged — never a half-applied marker that strands it while the
+        // caller only sees Err.
+        let plan_json = tmp.path().join("prod").join("plan-1").join(PLAN_FILE);
+        fs::write(&plan_json, b"{ not json").unwrap();
+
+        let err = root
+            .begin_apply_checked("plan-1", |_facts| Ok::<(), Infallible>(()))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BeginApplyError::Staging(StagingError::State { .. })
+        ));
+
+        // The marker was NOT advanced. `load` would reparse the now-corrupt
+        // plan.json, so read state.json directly.
+        let state_raw =
+            fs::read_to_string(tmp.path().join("prod").join("plan-1").join(STATE_FILE)).unwrap();
+        assert!(
+            state_raw.contains("\"staged\""),
+            "plan must remain Staged when the handle build fails: {state_raw}"
+        );
+    }
+
+    #[test]
+    fn begin_apply_checked_result_can_transition_to_applied() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        stage_plan(&root, "plan-1", 3);
+
+        let staged = root
+            .begin_apply_checked("plan-1", |_facts| Ok::<(), Infallible>(()))
+            .unwrap();
+        // The Applying handle drives on to a terminal stage via the existing FSM.
+        staged.transition(UpdateStage::Applied).unwrap();
+        assert_eq!(
+            root.load("plan-1").unwrap().unwrap().stage().unwrap(),
+            UpdateStage::Applied
+        );
     }
 
     #[test]
