@@ -27,6 +27,13 @@ enroll = ["dep:reqwest", "dep:rcgen"]
 # same note in greentic-operator-trust's Cargo.toml.
 greentic-distributor-client = ">=1.1.0-dev, <1.2.0-0"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+# Staging FSM (ungated `staging` module): `fs4` for the per-env `.lock` flock and
+# the independent per-file audit-log flock; `tempfile` for the write-tmp → fsync
+# → rename atomic-write pattern. Both are small, filesystem-only deps — the
+# crate's leanness invariant is "no `greentic-deploy-spec` dep", not "no I/O
+# deps"; on-disk staging inherently needs these.
+fs4 = "0.13"
+tempfile = "3"
 hex = "0.4"
 rcgen = { version = "0.14", optional = true, default-features = false, features = ["pem", "ring"] }
 reqwest = { version = "0.13", optional = true, default-features = false, features = ["rustls", "json"] }
