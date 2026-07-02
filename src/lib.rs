@@ -16,9 +16,13 @@
 //! - [`staging`] — the on-disk staging state machine.
 //! - [`envelope`] — airgap update-bundle wrapper + import scanner.
 //! - [`binswap`] — verified on-disk binary swap + rollback (binary self-update track).
+//! - [`tls`] — client-cert (mTLS) transport + X.509 preflight (feature `mtls`).
+//! - [`enroll`] — client-side cert enrollment against the Cert-CA (feature `enroll`).
 
 pub mod binswap;
 pub mod catalogue;
+#[cfg(feature = "enroll")]
+pub mod enroll;
 pub mod envelope;
 pub mod plan;
 pub mod staging;

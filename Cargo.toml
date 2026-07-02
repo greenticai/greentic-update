@@ -14,6 +14,10 @@ categories = ["development-tools"]
 
 [features]
 mtls = ["dep:reqwest", "dep:x509-parser"]
+# Client-side cert enrollment (CSR generation + POST to the Cert-CA). Independent
+# of `mtls` (does not need x509 parsing), but pairs with it: enroll → persist →
+# build_mtls_client.
+enroll = ["dep:reqwest", "dep:rcgen"]
 
 [dependencies]
 # Only the (ungated) `signing` module is used today (DistClient lands with the
@@ -24,7 +28,8 @@ mtls = ["dep:reqwest", "dep:x509-parser"]
 greentic-distributor-client = ">=1.1.0-dev, <1.2.0-0"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 hex = "0.4"
-reqwest = { version = "0.13", optional = true, default-features = false, features = ["rustls"] }
+rcgen = { version = "0.14", optional = true, default-features = false, features = ["pem", "ring"] }
+reqwest = { version = "0.13", optional = true, default-features = false, features = ["rustls", "json"] }
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -36,5 +41,13 @@ x509-parser = { version = "0.18", optional = true }
 # Deterministic Ed25519 test keypairs (PKCS#8 / SPKI PEM) for plan signing tests.
 # `serde_json` is a normal dependency, so tests use it without re-declaring here.
 ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
-rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
+# `rcgen` is also an optional runtime dep (behind `enroll`); the dev-dep keeps it
+# available to plan/tls tests that run without that feature. `x509-parser` is
+# dev-only: it enables `CertificateSigningRequestParams::from_pem` so a test can
+# verify our generated CSR through the exact API the server uses. The shipped
+# client only *generates* CSRs, so the runtime dep stays lean (`pem`, `ring`).
+rcgen = { version = "0.14", default-features = false, features = ["pem", "ring", "x509-parser"] }
 time = "0.3"
+# Enrollment integration test: local mock CA + async runtime.
+httpmock = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
