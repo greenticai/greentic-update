@@ -249,6 +249,13 @@ pub enum StagingError {
         #[source]
         source: tempfile::PersistError,
     },
+    /// A path component under the staging root is a pre-existing symlink — a
+    /// write through it could escape the root, so it is refused.
+    #[error("path component `{}` is a symlink (escape risk)", .path.display())]
+    SymlinkAncestor { path: PathBuf },
+    /// Artifacts may only be written while the plan is `Downloading`.
+    #[error("cannot add artifacts to plan `{plan_id}` in stage `{stage}` (must be downloading)")]
+    ArtifactNotDownloading { plan_id: String, stage: UpdateStage },
 }
 
 // ---------------------------------------------------------------------------
@@ -278,6 +285,9 @@ impl UpdatesRoot {
             path: env_dir.clone(),
             source,
         })?;
+        if let Some(parent) = env_dir.parent() {
+            assert_no_symlink_ancestors(parent, &env_dir)?;
+        }
         Ok(Self {
             env_dir,
             env_id: env_id.to_string(),
@@ -308,7 +318,7 @@ impl UpdatesRoot {
         envelope_bytes: &[u8],
     ) -> Result<StagedPlan, StagingError> {
         let plan = &verified.plan;
-        safe_segment(&plan.plan_id, "plan_id")?;
+        validate_plan_id(&plan.plan_id)?;
         if plan.env_id != self.env_id {
             return Err(StagingError::EnvMismatch {
                 plan_env: plan.env_id.clone(),
@@ -326,6 +336,10 @@ impl UpdatesRoot {
         }
 
         let artifacts_dir = plan_dir.join(ARTIFACTS_DIR);
+        // Refuse to write through a pre-planted symlink at any component
+        // (env/plan/artifacts). Runs under the env lock, immediately before the
+        // writes below, so the TOCTOU window is bounded to the lock scope.
+        assert_no_symlink_ancestors(&self.env_dir, &artifacts_dir)?;
         fs::create_dir_all(&artifacts_dir).map_err(|source| StagingError::Io {
             path: artifacts_dir,
             source,
@@ -372,7 +386,7 @@ impl UpdatesRoot {
 
     /// Load a previously-staged plan by id, or `None` if not staged.
     pub fn load(&self, plan_id: &str) -> Result<Option<StagedPlan>, StagingError> {
-        safe_segment(plan_id, "plan_id")?;
+        validate_plan_id(plan_id)?;
         let plan_dir = self.env_dir.join(plan_id);
         let Some(state) = read_state(&plan_dir)? else {
             return Ok(None);
@@ -395,8 +409,15 @@ impl UpdatesRoot {
         }))
     }
 
-    /// The `state.json` of every staged plan (skips `audit/`, `.lock`, and any
-    /// directory without a readable marker). Order is filesystem-dependent.
+    /// The `state.json` of every staged plan. Order is filesystem-dependent.
+    ///
+    /// `state.json` is treated as untrusted: an entry is included only if its
+    /// directory name is a valid plan id (this also skips `audit/` and `.lock`)
+    /// **and** the marker's own `plan_id` equals that directory name. A corrupt,
+    /// foreign, or unreadable marker is skipped rather than trusted — so an
+    /// attacker-controlled `plan_id` can never drive a filesystem path in
+    /// [`latest_applied_sequence`](Self::latest_applied_sequence) or
+    /// [`apply_retention`](Self::apply_retention).
     pub fn list(&self) -> Result<Vec<StageState>, StagingError> {
         let mut out = Vec::new();
         let entries = match fs::read_dir(&self.env_dir) {
@@ -417,10 +438,19 @@ impl UpdatesRoot {
             if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
             }
-            if entry.file_name() == AUDIT_DIR {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if validate_plan_id(&name).is_err() {
                 continue;
             }
-            if let Some(state) = read_state(&entry.path())? {
+            // Anchor the marker to its directory: ignore a `state.json` whose
+            // `plan_id` disagrees with the directory it lives in (corrupt or
+            // foreign), and swallow per-entry read errors so one bad directory
+            // cannot break enumeration.
+            if let Ok(Some(state)) = read_state(&entry.path())
+                && state.plan_id == name
+            {
                 out.push(state);
             }
         }
@@ -456,7 +486,11 @@ impl UpdatesRoot {
 
         let mut evicted = Vec::new();
         for state in terminal.into_iter().skip(policy.keep_terminal) {
+            // `state.plan_id` came through `list`, which requires it to equal a
+            // validated directory name, so this join cannot escape the env dir.
+            // Guard against a symlinked plan dir before the recursive delete.
             let plan_dir = self.env_dir.join(&state.plan_id);
+            assert_no_symlink_ancestors(&self.env_dir, &plan_dir)?;
             fs::remove_dir_all(&plan_dir).map_err(|source| StagingError::Io {
                 path: plan_dir,
                 source,
@@ -528,7 +562,9 @@ impl StagedPlan {
     /// Verify `bytes` against `artifact.digest`, then write them to
     /// `artifacts/sha256-<hex>/blob`. Content-addressed and idempotent (a
     /// re-download of the same digest overwrites identical bytes). Rejects a
-    /// malformed digest or a hash mismatch **before** writing.
+    /// malformed digest or a hash mismatch **before** writing. Takes the per-env
+    /// lock and requires the plan to still be `Downloading` — an artifact must
+    /// not land in a promoted or terminal plan.
     pub fn put_artifact(
         &self,
         artifact: &PlanArtifact,
@@ -548,11 +584,27 @@ impl StagedPlan {
                 actual: format!("sha256:{actual_hex}"),
             });
         }
+        // Serialize with transitions/retention and refuse to write into a plan
+        // that has already left `Downloading`.
+        let _lock = acquire_lock(&self.env_dir)?;
+        let stage = read_state(&self.plan_dir)?
+            .ok_or_else(|| StagingError::PlanNotFound {
+                plan_id: self.plan.plan_id.clone(),
+                env_id: self.env_id.clone(),
+            })?
+            .stage;
+        if stage != UpdateStage::Downloading {
+            return Err(StagingError::ArtifactNotDownloading {
+                plan_id: self.plan.plan_id.clone(),
+                stage,
+            });
+        }
         let blob = self
             .plan_dir
             .join(ARTIFACTS_DIR)
             .join(&dir_name)
             .join(BLOB_FILE);
+        assert_no_symlink_ancestors(&self.env_dir, &blob)?;
         atomic_write_bytes(&blob, bytes)?;
         Ok(blob)
     }
@@ -576,7 +628,15 @@ impl StagedPlan {
         }
         state.stage = to;
         state.updated_at = Utc::now();
+        assert_no_symlink_ancestors(&self.env_dir, &self.plan_dir.join(STATE_FILE))?;
         write_state(&self.plan_dir, &state)?;
+        // State is committed before the audit line: if the append or its fsync
+        // fails, the transition is already durable and this returns Err (a retry
+        // then hits InvalidTransition). This is the same commit-then-audit gap
+        // the deployer's `audit_and_record` documents and accepts — the on-disk
+        // backend has no cross-file transaction, and the stage marker is the
+        // source of truth. A crash in this window likewise leaves a committed
+        // transition with no audit line.
         append_audit(
             &self.env_dir,
             &make_event(
@@ -658,6 +718,52 @@ fn safe_segment(segment: &str, kind: &'static str) -> Result<(), StagingError> {
             segment: segment.to_string(),
             reason: "empty, `.`/`..`, or contains a path separator",
         });
+    }
+    Ok(())
+}
+
+/// Validate a plan id: a [`safe_segment`] that is not a reserved name colliding
+/// with the staging infrastructure (`audit/`, `.lock`). Used everywhere a
+/// `plan_id` becomes a directory under the env root, and to filter directory
+/// enumeration.
+fn validate_plan_id(plan_id: &str) -> Result<(), StagingError> {
+    safe_segment(plan_id, "plan_id")?;
+    if plan_id == AUDIT_DIR || plan_id == LOCK_FILE {
+        return Err(StagingError::UnsafeSegment {
+            kind: "plan_id",
+            segment: plan_id.to_string(),
+            reason: "reserved name that collides with staging infrastructure",
+        });
+    }
+    Ok(())
+}
+
+/// Reject a write whose path traverses a pre-existing symlink between `root` and
+/// `target` (inclusive of `target`). Only existing components are checked; the
+/// guard must run under the env `.lock`, immediately before the write, so the
+/// TOCTOU window is bounded to the lock scope. Mirrors the deployer's
+/// `path_safety::assert_no_symlink_ancestors`. No-op when `target` is not under
+/// `root`.
+fn assert_no_symlink_ancestors(root: &Path, target: &Path) -> Result<(), StagingError> {
+    let Ok(suffix) = target.strip_prefix(root) else {
+        return Ok(());
+    };
+    let mut current = root.to_path_buf();
+    for component in suffix.components() {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(meta) if meta.is_symlink() => {
+                return Err(StagingError::SymlinkAncestor { path: current });
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(source) => {
+                return Err(StagingError::Io {
+                    path: current,
+                    source,
+                });
+            }
+        }
     }
     Ok(())
 }
@@ -1005,6 +1111,111 @@ mod tests {
                 kind: "plan_id",
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn begin_rejects_reserved_plan_ids() {
+        // Reserved names would collide with the staging infrastructure: a plan
+        // dir named `audit` clobbers the audit-log dir, `.lock` the env lock.
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        for reserved in ["audit", ".lock"] {
+            let v = verified(plan_with(reserved, "prod", 1, vec![]));
+            assert!(
+                matches!(
+                    root.begin(&v, b"p", b"s"),
+                    Err(StagingError::UnsafeSegment {
+                        kind: "plan_id",
+                        ..
+                    })
+                ),
+                "plan_id `{reserved}` must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn put_artifact_requires_downloading_stage() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        let payload = b"payload";
+        let art = artifact("pack-a", payload);
+        let staged = root
+            .begin(
+                &verified(plan_with("plan-1", "prod", 1, vec![art.clone()])),
+                b"p",
+                b"s",
+            )
+            .unwrap();
+        // Fine while Downloading.
+        staged.put_artifact(&art, payload).unwrap();
+        // After promotion out of Downloading, artifact writes are refused.
+        staged.transition(UpdateStage::Inbox).unwrap();
+        assert!(matches!(
+            staged.put_artifact(&art, payload),
+            Err(StagingError::ArtifactNotDownloading { .. })
+        ));
+    }
+
+    #[test]
+    fn list_ignores_marker_whose_plan_id_mismatches_its_dir() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        // One legit plan.
+        root.begin(&verified(plan_with("real", "prod", 1, vec![])), b"p", b"s")
+            .unwrap();
+        // A decoy directory whose state.json claims a traversal plan_id — the
+        // finding-1 attack: retention must not join this untrusted value.
+        let decoy = root.env_dir().join("decoy");
+        fs::create_dir_all(&decoy).unwrap();
+        let now = Utc::now();
+        let forged = StageState {
+            schema: STAGE_STATE_SCHEMA_V1.to_string(),
+            plan_id: "../escape".to_string(),
+            env_id: "prod".to_string(),
+            sequence: 99,
+            plan_sha256: "0".repeat(64),
+            stage: UpdateStage::Failed,
+            created_at: now,
+            updated_at: now,
+        };
+        write_state(&decoy, &forged).unwrap();
+
+        // `list` surfaces only the plan whose marker matches its directory.
+        let ids: Vec<String> = root
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.plan_id)
+            .collect();
+        assert_eq!(ids, vec!["real".to_string()]);
+
+        // Retention operates on that validated set only; the forged terminal
+        // marker is ignored, so no path is ever built from its plan_id.
+        let report = root
+            .apply_retention(&RetentionPolicy { keep_terminal: 0 })
+            .unwrap();
+        assert!(report.evicted.is_empty(), "only `real` (active) remained");
+        assert!(
+            decoy.exists(),
+            "decoy must not be deleted via its forged plan_id"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn begin_rejects_symlinked_plan_dir() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        // Pre-plant <env>/evil as a symlink to a dir outside the staging root.
+        symlink(outside.path(), root.env_dir().join("evil")).unwrap();
+        let v = verified(plan_with("evil", "prod", 1, vec![]));
+        assert!(matches!(
+            root.begin(&v, b"p", b"s"),
+            Err(StagingError::SymlinkAncestor { .. })
         ));
     }
 
