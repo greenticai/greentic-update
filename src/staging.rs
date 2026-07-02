@@ -41,6 +41,8 @@
 //! Operator-identity auditing (who ran the verb) belongs to the caller's audit
 //! ledger; this module records only the mechanical stage transitions.
 
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -255,6 +257,20 @@ pub enum StagingError {
     /// Artifacts may only be written while the plan is `Downloading`.
     #[error("cannot add artifacts to plan `{plan_id}` in stage `{stage}` (must be downloading)")]
     ArtifactNotDownloading { plan_id: String, stage: UpdateStage },
+    /// A strict admission scan (`begin_checked`) found a plan directory whose
+    /// `state.json` is unreadable, corrupt, or names a different plan than its
+    /// directory. Unlike the best-effort [`list`](UpdatesRoot::list), admission
+    /// fails **closed** rather than silently omit a possibly-`Applied` plan from
+    /// the downgrade/compat snapshot.
+    #[error("cannot trust state for plan `{plan_id}` during admission: {reason}")]
+    CorruptAdmissionState { plan_id: String, reason: String },
+    /// The current thread already holds this env's `.lock`. The flock is not
+    /// reentrant, so re-acquiring would deadlock — this is returned instead of
+    /// hanging. It signals a staging method was called from inside a
+    /// [`begin_checked`](UpdatesRoot::begin_checked) admission predicate, which
+    /// already holds the lock; predicates must only read [`AdmissionFacts`].
+    #[error("env lock at {path} re-entered by the same thread (would deadlock)")]
+    LockReentered { path: PathBuf },
 }
 
 /// Error from [`UpdatesRoot::begin_checked`]: either the caller's admission
@@ -397,7 +413,7 @@ impl UpdatesRoot {
         }
 
         // Snapshot the applied set under the held lock, then let the caller gate
-        // on it. `admission_facts_locked` calls the lock-free `list()`, so it
+        // on it. `admission_facts_locked` uses the lock-free `scan_plans`, so it
         // does not re-enter `acquire_lock` (fs4 flock is not reentrant).
         let facts = self.admission_facts_locked()?;
         admission(&facts).map_err(BeginCheckedError::Rejected)?;
@@ -419,11 +435,13 @@ impl UpdatesRoot {
 
     /// The applied-plan facts an admission predicate needs. **Must be called
     /// with the env `.lock` held** so the snapshot is race-free against a
-    /// concurrent apply; it relies on `list()` being lock-free (see its doc) to
-    /// avoid re-entering the non-reentrant flock.
+    /// concurrent apply; it relies on the lock-free `scan_plans` (see its doc)
+    /// to avoid re-entering the non-reentrant flock. Uses the **strict** scan:
+    /// a corrupt or directory-mismatched `Applied` marker fails admission closed
+    /// rather than lowering the visible `latest_applied_sequence`.
     fn admission_facts_locked(&self) -> Result<AdmissionFacts, StagingError> {
         let applied: Vec<StageState> = self
-            .list()?
+            .scan_plans(true)?
             .into_iter()
             .filter(|s| s.stage == UpdateStage::Applied)
             .collect();
@@ -523,11 +541,8 @@ impl UpdatesRoot {
     }
 
     /// The `state.json` of every staged plan. Order is filesystem-dependent.
-    ///
-    /// Deliberately **does not** acquire the env `.lock`, so it can be called by
-    /// callers that already hold it (`apply_retention`, `begin_checked` via
-    /// `admission_facts_locked`). The flock is not reentrant — adding a lock
-    /// here would deadlock those callers.
+    /// Best-effort (forgiving) enumeration — see [`scan_plans`] for the
+    /// lock-free contract and the strict admission variant.
     ///
     /// `state.json` is treated as untrusted: an entry is included only if its
     /// directory name is a valid plan id (this also skips `audit/` and `.lock`)
@@ -536,7 +551,25 @@ impl UpdatesRoot {
     /// attacker-controlled `plan_id` can never drive a filesystem path in
     /// [`latest_applied_sequence`](Self::latest_applied_sequence) or
     /// [`apply_retention`](Self::apply_retention).
+    ///
+    /// [`scan_plans`]: Self::scan_plans
     pub fn list(&self) -> Result<Vec<StageState>, StagingError> {
+        self.scan_plans(false)
+    }
+
+    /// Enumerate plan markers under the env dir. Deliberately **does not**
+    /// acquire the env `.lock`, so it can be called by callers that already hold
+    /// it (`apply_retention`, `begin_checked` via `admission_facts_locked`) —
+    /// the flock is not reentrant, so acquiring one here would deadlock them.
+    ///
+    /// With `strict == false` this is the forgiving [`list`](Self::list)
+    /// behavior: a present-but-unreadable, corrupt, or directory-mismatched
+    /// `state.json` is silently skipped. With `strict == true` (admission scans)
+    /// any such marker is a hard [`StagingError::CorruptAdmissionState`], so a
+    /// safety decision never runs against a snapshot that silently dropped a
+    /// possibly-`Applied` plan. An *absent* `state.json` is a legitimately
+    /// incomplete plan and is skipped in both modes.
+    fn scan_plans(&self, strict: bool) -> Result<Vec<StageState>, StagingError> {
         let mut out = Vec::new();
         let entries = match fs::read_dir(&self.env_dir) {
             Ok(entries) => entries,
@@ -559,17 +592,34 @@ impl UpdatesRoot {
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
+            // Non-plan-id dirs (`audit/`, `.lock`, anything unsafe) are
+            // infrastructure, not plans — skipped in both modes.
             if validate_plan_id(&name).is_err() {
                 continue;
             }
-            // Anchor the marker to its directory: ignore a `state.json` whose
-            // `plan_id` disagrees with the directory it lives in (corrupt or
-            // foreign), and swallow per-entry read errors so one bad directory
-            // cannot break enumeration.
-            if let Ok(Some(state)) = read_state(&entry.path())
-                && state.plan_id == name
-            {
-                out.push(state);
+            // Anchor the marker to its directory. An unreadable, corrupt, or
+            // directory-mismatched marker is untrusted: `list()` skips it
+            // (best-effort), but a strict admission scan fails closed rather
+            // than silently omit a possibly-`Applied` plan.
+            match read_state(&entry.path()) {
+                Ok(Some(state)) if state.plan_id == name => out.push(state),
+                Ok(Some(state)) if strict => {
+                    return Err(StagingError::CorruptAdmissionState {
+                        plan_id: name,
+                        reason: format!(
+                            "state.json plan_id `{}` disagrees with its directory",
+                            state.plan_id
+                        ),
+                    });
+                }
+                Err(source) if strict => {
+                    return Err(StagingError::CorruptAdmissionState {
+                        plan_id: name,
+                        reason: format!("state.json is unreadable: {source}"),
+                    });
+                }
+                // Absent marker, or non-strict skip of an untrusted one.
+                Ok(None) | Ok(Some(_)) | Err(_) => {}
             }
         }
         Ok(out)
@@ -957,12 +1007,43 @@ fn fsync_parent(_parent: &Path) -> Result<(), StagingError> {
     Ok(())
 }
 
-/// RAII exclusive lock on `<env_dir>/.lock`. Dropping releases the OS lock.
+thread_local! {
+    /// Env dirs whose `.lock` this thread currently holds. The fs4 flock is per
+    /// open-file-description, so a *second* `acquire_lock` on the same thread
+    /// would block forever waiting on a lock the thread itself already holds. We
+    /// detect that re-entry and fail fast with [`StagingError::LockReentered`].
+    /// Only same-thread re-entry is caught; other threads and processes still
+    /// contend on the OS flock as normal.
+    static HELD_ENV_LOCKS: RefCell<HashSet<PathBuf>> = RefCell::new(HashSet::new());
+}
+
+/// RAII exclusive lock on `<env_dir>/.lock`. Dropping releases the OS lock and
+/// clears this thread's re-entry guard for the env.
 struct Flock {
     _file: File,
+    env_dir: PathBuf,
+}
+
+impl Drop for Flock {
+    fn drop(&mut self) {
+        HELD_ENV_LOCKS.with(|held| {
+            held.borrow_mut().remove(&self.env_dir);
+        });
+        // The `_file` field drops next, releasing the OS flock.
+    }
 }
 
 fn acquire_lock(env_dir: &Path) -> Result<Flock, StagingError> {
+    let key = env_dir.to_path_buf();
+    // Same-thread re-entry would deadlock on the non-reentrant flock — fail fast
+    // rather than hang. Checked (not inserted) here so failed acquisitions below
+    // never leave a stale guard entry; ownership is recorded only once the OS
+    // lock is actually held.
+    if HELD_ENV_LOCKS.with(|held| held.borrow().contains(&key)) {
+        return Err(StagingError::LockReentered {
+            path: env_dir.join(LOCK_FILE),
+        });
+    }
     fs::create_dir_all(env_dir).map_err(|source| StagingError::Io {
         path: env_dir.to_path_buf(),
         source,
@@ -982,7 +1063,13 @@ fn acquire_lock(env_dir: &Path) -> Result<Flock, StagingError> {
         path: lock_path,
         source,
     })?;
-    Ok(Flock { _file: file })
+    HELD_ENV_LOCKS.with(|held| {
+        held.borrow_mut().insert(key.clone());
+    });
+    Ok(Flock {
+        _file: file,
+        env_dir: key,
+    })
 }
 
 fn make_event(
@@ -1328,6 +1415,58 @@ mod tests {
             BeginCheckedError::Staging(StagingError::PlanExists { .. })
         ));
         assert!(!called, "predicate must not run for an already-staged plan");
+    }
+
+    #[test]
+    fn begin_checked_fails_closed_on_corrupt_applied_marker() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        apply_plan(&root, "old", 5);
+
+        // Corrupt the applied plan's marker (disk corruption / local tamper).
+        let marker = tmp.path().join("prod").join("old").join(STATE_FILE);
+        fs::write(&marker, b"{ not valid json").unwrap();
+
+        // Admission must fail CLOSED — not silently drop `old` (lowering the
+        // visible latest sequence) and admit a stale plan.
+        let err = root
+            .begin_checked(
+                &verified(plan_with("new", "prod", 6, vec![])),
+                b"p",
+                b"s",
+                |_facts| Ok::<(), Infallible>(()),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BeginCheckedError::Staging(StagingError::CorruptAdmissionState { .. })
+        ));
+        // The best-effort `list()` still tolerates the corrupt marker.
+        assert!(root.list().is_ok());
+    }
+
+    #[test]
+    fn begin_checked_predicate_reentering_lock_fails_fast_not_deadlock() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+
+        // A predicate that misuses the API by calling a locking method while the
+        // env lock is held must get `LockReentered` — never hang.
+        let err = root
+            .begin_checked(
+                &verified(plan_with("plan-1", "prod", 1, vec![])),
+                b"p",
+                b"s",
+                |_facts| {
+                    root.apply_retention(&RetentionPolicy { keep_terminal: 1 })
+                        .map(|_| ())
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BeginCheckedError::Rejected(StagingError::LockReentered { .. })
+        ));
     }
 
     #[test]
