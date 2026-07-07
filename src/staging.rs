@@ -1417,6 +1417,7 @@ mod tests {
             nonce: "test-nonce".to_string(),
             target: serde_json::json!({}),
             artifacts,
+            binaries: vec![],
             compat: CompatRequirements::default(),
             rollback: RollbackPolicy {
                 policy: RollbackKind::Auto,

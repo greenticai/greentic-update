@@ -70,8 +70,17 @@ pub struct UpdatePlan {
     /// opaque JSON so this crate does not depend on `greentic-deploy-spec`.
     pub target: serde_json::Value,
     /// Content artifacts the plan references (packs / bundles / components).
-    /// Binary self-update artifacts are a separate, additive list (P7).
     pub artifacts: Vec<PlanArtifact>,
+    /// Binary self-update artifacts — an additive, platform-keyed list of
+    /// binaries the plan authorizes the environment to install. Each entry
+    /// carries a Rust target triple so the runtime can select the binary for
+    /// its host. The plan's DSSE signature covers this list transitively (the
+    /// subject pins `sha256(plan_bytes)`, which includes the serialized
+    /// `binaries`). Empty when the plan carries no binary updates — the field
+    /// is omitted from JSON in that case to keep existing plan shapes (and
+    /// their signatures) byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub binaries: Vec<BinaryArtifact>,
     /// Compatibility constraints the environment must satisfy before apply.
     pub compat: CompatRequirements,
     /// Rollback policy applied if an apply fails its health gate.
@@ -89,6 +98,32 @@ pub struct PlanArtifact {
     pub digest: String,
     /// Where to fetch it (registry coordinate / URL). Absent for artifacts
     /// already carried in-band by an airgap envelope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+/// One binary artifact in the plan's self-update set.
+///
+/// Each entry describes a single platform-specific binary that the plan
+/// authorizes the environment to install. Trustworthiness comes from the plan's
+/// DSSE signature: the subject pins `sha256(plan_bytes)`, which transitively
+/// covers every `BinaryArtifact` (including its `digest`). There is no
+/// separate per-binary signature — the operator pins `digest` at plan-build
+/// time, and the DSSE envelope is the single trust anchor.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BinaryArtifact {
+    /// Logical binary name (`"gtc"`, `"greentic-runner"`, `"greentic-start"`).
+    pub name: String,
+    /// Binary version (semver).
+    pub version: String,
+    /// Rust target triple (e.g. `"x86_64-unknown-linux-gnu"`).
+    pub target: String,
+    /// Content digest of the inner binary, `sha256:<hex>`. This is the trust
+    /// anchor pinned by the operator at plan-build time; the plan's DSSE
+    /// signature covers it transitively.
+    pub digest: String,
+    /// Download URL or registry coordinate. Absent when the binary is carried
+    /// in-band by an airgap envelope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
 }
@@ -203,6 +238,10 @@ pub enum PlanError {
     /// Also blocks re-applying an already-applied plan (replay).
     #[error("update-plan downgrade refused: sequence {plan} is not newer than last applied {last}")]
     Downgrade { plan: u64, last: u64 },
+    /// More than one binary artifact matches the same target triple — the plan
+    /// is ambiguous and cannot be applied (fail-closed, never guess).
+    #[error("ambiguous binary selection: {count} entries match target `{target}`")]
+    AmbiguousBinary { target: String, count: usize },
 }
 
 /// Why a plan's compatibility requirements were not satisfied by the runtime.
@@ -451,6 +490,40 @@ pub fn check_compat(
     Ok(())
 }
 
+/// Select the binary artifact for a given target triple from the plan's
+/// `binaries` list.
+///
+/// Returns `Ok(Some(&art))` when exactly one binary matches `target`,
+/// `Ok(None)` when no binary targets this host (no update available — not an
+/// error), or `Err(PlanError::AmbiguousBinary)` when more than one entry
+/// shares the same triple (fail-closed — never guess).
+///
+/// `target` is the Rust target triple of the running host (e.g. from
+/// `binswap::current_target()`). This function is pure and does not depend on
+/// the binswap module or build.rs — callers pass the triple in.
+pub fn select_binary_for_target<'a>(
+    binaries: &'a [BinaryArtifact],
+    target: &str,
+) -> Result<Option<&'a BinaryArtifact>, PlanError> {
+    let mut matched: Option<&'a BinaryArtifact> = None;
+    let mut count = 0usize;
+    for b in binaries {
+        if b.target == target {
+            if matched.is_none() {
+                matched = Some(b);
+            }
+            count += 1;
+        }
+    }
+    if count > 1 {
+        return Err(PlanError::AmbiguousBinary {
+            target: target.to_string(),
+            count,
+        });
+    }
+    Ok(matched)
+}
+
 /// Lowercase-hex SHA-256 of `bytes` — the digest form pinned in the DSSE
 /// subject (bare, no `sha256:` prefix).
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -502,6 +575,7 @@ mod tests {
                 digest: "sha256:deadbeef".to_string(),
                 source: Some("oci://ghcr.io/greenticai/packs/weather:1.2.3".to_string()),
             }],
+            binaries: vec![],
             compat: CompatRequirements {
                 min_runtime: Some("1.1.0".to_string()),
                 abi: Some("greentic:component@0.6.0".to_string()),
@@ -844,5 +918,136 @@ mod tests {
         let err = build_update_plan(&sample_plan(1), &priv_pem, "", &trust)
             .expect_err("empty key id refused");
         assert!(matches!(err, PlanError::KeyNotTrusted { .. }));
+    }
+
+    // ---- BinaryArtifact / binaries field tests ----
+
+    fn sample_binary(name: &str, target: &str) -> BinaryArtifact {
+        BinaryArtifact {
+            name: name.to_string(),
+            version: "1.1.5".to_string(),
+            target: target.to_string(),
+            digest: format!("sha256:{name}_{target}_cafe"),
+            source: Some(format!("https://example.com/{name}-{target}.tar.gz")),
+        }
+    }
+
+    /// A plan with an empty `binaries` vec serializes to JSON that does NOT
+    /// contain a `"binaries"` key (proves `skip_serializing_if` omits it),
+    /// and re-serializing the deserialized result produces byte-identical
+    /// output. This means existing DSSE signatures (whose subject pins
+    /// `sha256(plan_bytes)`) remain valid after the schema addition.
+    #[test]
+    fn empty_binaries_is_byte_identical_to_absent_field() {
+        let plan = sample_plan(1);
+        assert!(plan.binaries.is_empty());
+
+        let bytes_a = serde_json::to_vec_pretty(&plan).unwrap();
+        let json_str = String::from_utf8_lossy(&bytes_a);
+
+        // The key must not appear in the serialized JSON at all.
+        assert!(
+            !json_str.contains("\"binaries\""),
+            "empty binaries must be omitted from JSON"
+        );
+
+        // Deserialize (binaries defaults to empty) and re-serialize — bytes
+        // must be identical (the struct round-trips without gaining a key).
+        let back: UpdatePlan = serde_json::from_slice(&bytes_a).unwrap();
+        assert!(back.binaries.is_empty());
+        let bytes_b = serde_json::to_vec_pretty(&back).unwrap();
+        assert_eq!(bytes_a, bytes_b, "struct round-trip must be byte-stable");
+    }
+
+    /// An existing-format plan (no `binaries` key at all) still deserializes
+    /// and build/verify round-trips without any change.
+    #[test]
+    fn old_format_plan_without_binaries_still_verifies() {
+        let (priv_pem, tk) = test_key(7);
+        let trust = TrustRoot::new(vec![tk.clone()]);
+        let plan = sample_plan(3);
+
+        // Build and sign: since binaries is empty, the JSON never contains
+        // a "binaries" key — so the signed bytes are identical to what a
+        // pre-P7 signer would have produced.
+        let built = build_update_plan(&plan, &priv_pem, &tk.key_id, &trust)
+            .expect("builds without binaries");
+        let json_str = String::from_utf8_lossy(&built.plan_bytes);
+        assert!(
+            !json_str.contains("\"binaries\""),
+            "signed plan bytes must not contain a binaries key"
+        );
+
+        // Verify: the signed bytes verify, and the deserialized plan has
+        // empty binaries (defaulted from the absent key).
+        let verified = verify_update_plan(&built.plan_bytes, &built.envelope_bytes, &trust)
+            .expect("old-format plan verifies");
+        assert!(verified.plan.binaries.is_empty());
+        assert_eq!(verified.plan, plan);
+    }
+
+    /// A plan carrying binary artifacts builds, self-verifies, and JSON
+    /// round-trips with equality.
+    #[test]
+    fn roundtrip_with_binaries() {
+        let (priv_pem, tk) = test_key(7);
+        let trust = TrustRoot::new(vec![tk.clone()]);
+        let mut plan = sample_plan(10);
+        plan.binaries = vec![
+            sample_binary("gtc", "x86_64-unknown-linux-gnu"),
+            sample_binary("greentic-runner", "aarch64-apple-darwin"),
+        ];
+
+        let built =
+            build_update_plan(&plan, &priv_pem, &tk.key_id, &trust).expect("builds with binaries");
+        let verified = verify_update_plan(&built.plan_bytes, &built.envelope_bytes, &trust)
+            .expect("verifies with binaries");
+        assert_eq!(verified.plan, plan);
+        assert_eq!(verified.plan.binaries.len(), 2);
+        assert_eq!(verified.plan.binaries[0].name, "gtc");
+        assert_eq!(verified.plan.binaries[1].target, "aarch64-apple-darwin");
+
+        // JSON round-trip.
+        let bytes = serde_json::to_vec_pretty(&plan).unwrap();
+        let back: UpdatePlan = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(plan, back);
+    }
+
+    #[test]
+    fn select_binary_for_target_picks_matching_triple() {
+        let bins = vec![
+            sample_binary("gtc", "x86_64-unknown-linux-gnu"),
+            sample_binary("gtc", "aarch64-apple-darwin"),
+        ];
+        let picked = select_binary_for_target(&bins, "aarch64-apple-darwin")
+            .expect("no error")
+            .expect("found");
+        assert_eq!(picked.target, "aarch64-apple-darwin");
+        assert_eq!(picked.name, "gtc");
+    }
+
+    #[test]
+    fn select_binary_for_target_returns_none_on_no_match() {
+        let bins = vec![sample_binary("gtc", "x86_64-unknown-linux-gnu")];
+        let result =
+            select_binary_for_target(&bins, "aarch64-unknown-linux-gnu").expect("no error");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn select_binary_for_target_returns_none_on_empty_list() {
+        let result = select_binary_for_target(&[], "x86_64-unknown-linux-gnu").expect("no error");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn select_binary_for_target_errors_on_ambiguous_triple() {
+        let bins = vec![
+            sample_binary("gtc", "x86_64-unknown-linux-gnu"),
+            sample_binary("greentic-runner", "x86_64-unknown-linux-gnu"),
+        ];
+        let err = select_binary_for_target(&bins, "x86_64-unknown-linux-gnu")
+            .expect_err("ambiguous triple");
+        assert!(matches!(err, PlanError::AmbiguousBinary { count: 2, .. }));
     }
 }
