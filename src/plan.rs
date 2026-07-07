@@ -118,9 +118,9 @@ pub struct BinaryArtifact {
     pub version: String,
     /// Rust target triple (e.g. `"x86_64-unknown-linux-gnu"`).
     pub target: String,
-    /// Content digest of the inner binary, `sha256:<hex>`. This is the trust
-    /// anchor pinned by the operator at plan-build time; the plan's DSSE
-    /// signature covers it transitively.
+    /// Content digest of the inner binary, `sha256:<hex>`. The operator pins
+    /// this value at plan-build time; its integrity is protected by the plan's
+    /// DSSE signature (the sole trust anchor — see struct doc).
     pub digest: String,
     /// Download URL or registry coordinate. Absent when the binary is carried
     /// in-band by an airgap envelope.
@@ -238,10 +238,14 @@ pub enum PlanError {
     /// Also blocks re-applying an already-applied plan (replay).
     #[error("update-plan downgrade refused: sequence {plan} is not newer than last applied {last}")]
     Downgrade { plan: u64, last: u64 },
-    /// More than one binary artifact matches the same target triple — the plan
-    /// is ambiguous and cannot be applied (fail-closed, never guess).
-    #[error("ambiguous binary selection: {count} entries match target `{target}`")]
-    AmbiguousBinary { target: String, count: usize },
+    /// More than one binary artifact matches the same (name, target) pair — the
+    /// plan is ambiguous and cannot be applied (fail-closed, never guess).
+    #[error("ambiguous binary selection: {count} entries match `{name}` for target `{target}`")]
+    AmbiguousBinary {
+        name: String,
+        target: String,
+        count: usize,
+    },
 }
 
 /// Why a plan's compatibility requirements were not satisfied by the runtime.
@@ -490,25 +494,30 @@ pub fn check_compat(
     Ok(())
 }
 
-/// Select the binary artifact for a given target triple from the plan's
+/// Select a named binary artifact for a given target triple from the plan's
 /// `binaries` list.
 ///
-/// Returns `Ok(Some(&art))` when exactly one binary matches `target`,
-/// `Ok(None)` when no binary targets this host (no update available — not an
-/// error), or `Err(PlanError::AmbiguousBinary)` when more than one entry
-/// shares the same triple (fail-closed — never guess).
+/// Returns `Ok(Some(&art))` when exactly one binary matches the `(name,
+/// target)` pair, `Ok(None)` when no binary matches (no update available — not
+/// an error), or `Err(PlanError::AmbiguousBinary)` when more than one entry
+/// shares the same pair (fail-closed — never guess).
+///
+/// A plan legitimately carries multiple binaries for the same target triple
+/// (e.g. `"gtc"`, `"greentic-runner"`, `"greentic-start"` all for
+/// `x86_64-unknown-linux-gnu`). The `name` parameter disambiguates.
 ///
 /// `target` is the Rust target triple of the running host (e.g. from
 /// `binswap::current_target()`). This function is pure and does not depend on
-/// the binswap module or build.rs — callers pass the triple in.
-pub fn select_binary_for_target<'a>(
+/// the binswap module or build.rs — callers pass both values in.
+pub fn select_binary<'a>(
     binaries: &'a [BinaryArtifact],
+    name: &str,
     target: &str,
 ) -> Result<Option<&'a BinaryArtifact>, PlanError> {
     let mut matched: Option<&'a BinaryArtifact> = None;
     let mut count = 0usize;
     for b in binaries {
-        if b.target == target {
+        if b.name == name && b.target == target {
             if matched.is_none() {
                 matched = Some(b);
             }
@@ -517,6 +526,7 @@ pub fn select_binary_for_target<'a>(
     }
     if count > 1 {
         return Err(PlanError::AmbiguousBinary {
+            name: name.to_string(),
             target: target.to_string(),
             count,
         });
@@ -1014,12 +1024,12 @@ mod tests {
     }
 
     #[test]
-    fn select_binary_for_target_picks_matching_triple() {
+    fn select_binary_picks_matching_name_and_triple() {
         let bins = vec![
             sample_binary("gtc", "x86_64-unknown-linux-gnu"),
             sample_binary("gtc", "aarch64-apple-darwin"),
         ];
-        let picked = select_binary_for_target(&bins, "aarch64-apple-darwin")
+        let picked = select_binary(&bins, "gtc", "aarch64-apple-darwin")
             .expect("no error")
             .expect("found");
         assert_eq!(picked.target, "aarch64-apple-darwin");
@@ -1027,27 +1037,48 @@ mod tests {
     }
 
     #[test]
-    fn select_binary_for_target_returns_none_on_no_match() {
-        let bins = vec![sample_binary("gtc", "x86_64-unknown-linux-gnu")];
-        let result =
-            select_binary_for_target(&bins, "aarch64-unknown-linux-gnu").expect("no error");
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn select_binary_for_target_returns_none_on_empty_list() {
-        let result = select_binary_for_target(&[], "x86_64-unknown-linux-gnu").expect("no error");
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn select_binary_for_target_errors_on_ambiguous_triple() {
+    fn select_binary_disambiguates_multiple_binaries_same_target() {
         let bins = vec![
             sample_binary("gtc", "x86_64-unknown-linux-gnu"),
             sample_binary("greentic-runner", "x86_64-unknown-linux-gnu"),
+            sample_binary("greentic-start", "x86_64-unknown-linux-gnu"),
         ];
-        let err = select_binary_for_target(&bins, "x86_64-unknown-linux-gnu")
-            .expect_err("ambiguous triple");
+        let picked = select_binary(&bins, "greentic-runner", "x86_64-unknown-linux-gnu")
+            .expect("no error")
+            .expect("found");
+        assert_eq!(picked.name, "greentic-runner");
+        assert_eq!(picked.target, "x86_64-unknown-linux-gnu");
+    }
+
+    #[test]
+    fn select_binary_returns_none_on_no_match() {
+        let bins = vec![sample_binary("gtc", "x86_64-unknown-linux-gnu")];
+        let result = select_binary(&bins, "gtc", "aarch64-unknown-linux-gnu").expect("no error");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn select_binary_returns_none_on_name_mismatch() {
+        let bins = vec![sample_binary("gtc", "x86_64-unknown-linux-gnu")];
+        let result =
+            select_binary(&bins, "greentic-runner", "x86_64-unknown-linux-gnu").expect("no error");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn select_binary_returns_none_on_empty_list() {
+        let result = select_binary(&[], "gtc", "x86_64-unknown-linux-gnu").expect("no error");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn select_binary_errors_on_duplicate_name_target_pair() {
+        let bins = vec![
+            sample_binary("gtc", "x86_64-unknown-linux-gnu"),
+            sample_binary("gtc", "x86_64-unknown-linux-gnu"),
+        ];
+        let err =
+            select_binary(&bins, "gtc", "x86_64-unknown-linux-gnu").expect_err("duplicate pair");
         assert!(matches!(err, PlanError::AmbiguousBinary { count: 2, .. }));
     }
 }
