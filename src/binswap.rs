@@ -144,10 +144,12 @@ pub struct SwapOutcome {
 /// Atomically replace the binary at `target` with `new_binary`, keeping a
 /// `.prev` rollback copy of the original.
 ///
-/// 1. Verify digest (if `opts.expected_digest` is set) — fail BEFORE touching
-///    `target` on mismatch.
-/// 2. Copy `target` to `<target>.prev` (preserving mode).
-/// 3. Write `new_binary` content to a temp file in the SAME directory as
+/// 1. Read `new_binary` content into memory (single read eliminates TOCTOU
+///    between digest check and install).
+/// 2. Verify digest (if `opts.expected_digest` is set) against the in-memory
+///    bytes — fail BEFORE touching `target` on mismatch.
+/// 3. Copy `target` to `<target>.prev` (preserving mode, fsynced).
+/// 4. Write the in-memory content to a temp file in the SAME directory as
 ///    `target` (same FS, no EXDEV), fsync, set 0755 (unix), rename over
 ///    `target` atomically.
 ///
@@ -156,19 +158,26 @@ pub struct SwapOutcome {
 /// running exe, the rename-away pattern (`self-replace` crate) is used
 /// instead.
 ///
-/// Any failure after step 2 leaves the ORIGINAL `target` intact — the rename
+/// Any failure after step 3 leaves the ORIGINAL `target` intact — the rename
 /// is the single atomic commit point.
 pub fn swap_binary(
     new_binary: &Path,
     target: &Path,
     opts: &SwapOptions,
 ) -> Result<SwapOutcome, BinSwapError> {
-    // Step 0: digest verification (fail-closed before any mutation).
+    // Step 0: read new binary content once into memory so the same bytes are
+    // both digest-verified and installed (eliminates TOCTOU window).
+    let new_bytes = fs::read(new_binary).map_err(|source| BinSwapError::Io {
+        path: new_binary.to_path_buf(),
+        source,
+    })?;
+
+    // Step 1: digest verification (fail-closed before any mutation).
     if let Some(expected) = &opts.expected_digest {
-        verify_digest(new_binary, expected)?;
+        verify_digest_bytes(&new_bytes, expected)?;
     }
 
-    // Step 1: target must exist.
+    // Step 2: target must exist.
     if !target.exists() {
         return Err(BinSwapError::TargetNotFound(target.to_path_buf()));
     }
@@ -181,7 +190,7 @@ pub fn swap_binary(
         ),
     })?;
 
-    // Step 2: rollback copy (target -> target.prev, preserving mode).
+    // Step 3: rollback copy (target -> target.prev, preserving mode).
     let prev_path = prev_path_for(target);
     fs::copy(target, &prev_path).map_err(|source| {
         if source.kind() == io::ErrorKind::PermissionDenied {
@@ -197,11 +206,14 @@ pub fn swap_binary(
         }
     })?;
 
-    // Step 3: read new binary content.
-    let new_bytes = fs::read(new_binary).map_err(|source| BinSwapError::Io {
-        path: new_binary.to_path_buf(),
-        source,
-    })?;
+    // Fsync the .prev file so it is durable on disk before the rename
+    // commits the swap — ensures rollback is safe even on power loss.
+    fs::File::open(&prev_path)
+        .and_then(|f| f.sync_all())
+        .map_err(|source| BinSwapError::Io {
+            path: prev_path.clone(),
+            source,
+        })?;
 
     // Step 4: atomic install (temp -> fsync -> chmod -> rename).
     atomic_install(&new_bytes, target, parent)?;
@@ -431,9 +443,10 @@ fn extract_to(reader: &mut impl Read, dest: &Path, cap: u64) -> Result<(), BinSw
 /// gtc or greentic-start binary-update verb), which decides whether to skip
 /// the swap inside a container image.
 pub fn is_container_environment() -> bool {
-    // 1. Explicit override.
+    // 1. Explicit override (case-insensitive: "True", "YES", "1" all match).
     if let Ok(val) = std::env::var(CONTAINER_ENV_VAR) {
-        return matches!(val.as_str(), "1" | "true" | "TRUE" | "yes" | "YES");
+        let lc = val.to_ascii_lowercase();
+        return matches!(lc.as_str(), "1" | "true" | "yes");
     }
 
     // 2. Docker sentinel file.
@@ -470,14 +483,10 @@ fn prev_path_for(target: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Verify that the file at `path` matches the expected digest. Tolerates the
+/// Verify that in-memory `bytes` match the expected digest. Tolerates the
 /// `sha256:` prefix and hex case, matching [`crate::catalogue`] semantics.
-fn verify_digest(path: &Path, expected: &str) -> Result<(), BinSwapError> {
-    let bytes = fs::read(path).map_err(|source| BinSwapError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let actual_hex = hex::encode(Sha256::digest(&bytes));
+fn verify_digest_bytes(bytes: &[u8], expected: &str) -> Result<(), BinSwapError> {
+    let actual_hex = hex::encode(Sha256::digest(bytes));
     let expected_hex = expected
         .trim()
         .strip_prefix("sha256:")
