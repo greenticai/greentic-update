@@ -18,6 +18,11 @@ mtls = ["dep:reqwest", "dep:x509-parser"]
 # of `mtls` (does not need x509 parsing), but pairs with it: enroll → persist →
 # build_mtls_client.
 enroll = ["dep:reqwest", "dep:rcgen"]
+# Binary self-update swap mechanics: archive unpack (tar+gzip, zip),
+# atomic verified binary swap + rollback, container detection, and
+# Windows running-exe replacement via `self-replace`. OFF by default
+# to keep the lean build free of archive / compression deps.
+binswap = ["dep:tar", "dep:flate2", "dep:zip", "dep:self-replace"]
 
 [dependencies]
 # Only the (ungated) `signing` module is used today (DistClient lands with the
@@ -43,6 +48,11 @@ serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
 x509-parser = { version = "0.18", optional = true }
+# binswap deps — archive extraction + Windows running-exe replacement.
+tar = { version = "0.4", optional = true }
+flate2 = { version = "1", optional = true }
+zip = { version = "2", optional = true, default-features = false, features = ["deflate"] }
+self-replace = { version = "1", optional = true }
 
 [dev-dependencies]
 # Deterministic Ed25519 test keypairs (PKCS#8 / SPKI PEM) for plan signing tests.
