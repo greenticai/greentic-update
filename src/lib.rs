@@ -19,6 +19,7 @@
 //! - [`tls`] — client-cert (mTLS) transport + X.509 preflight (feature `mtls`).
 //! - [`enroll`] — client-side cert enrollment against the Cert-CA (feature `enroll`).
 
+#[cfg(feature = "binswap")]
 pub mod binswap;
 pub mod catalogue;
 #[cfg(feature = "enroll")]
