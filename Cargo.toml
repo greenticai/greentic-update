@@ -18,7 +18,7 @@ categories = ["development-tools"]
 # distributor-client's `store_auth` module references the optional `dirs_next`
 # crate without a cfg gate, so the minimal build does not compile — see the
 # same note in greentic-operator-trust's Cargo.toml.
-greentic-distributor-client = ">=1.1.0-dev, <1.2.0-0"
+greentic-distributor-client = ">=1.1.0-dev, <1.4.0"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 hex = "0.4"
 semver = "1"
