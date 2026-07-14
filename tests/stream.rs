@@ -283,3 +283,79 @@ fn run_stream_404_is_terminal_no_retry() {
     );
     mock.assert_calls(1);
 }
+
+/// A retryable error status (503) must be RETRIED, not treated as terminal.
+///
+/// This is the decoy that keeps `run_stream_404_is_terminal_no_retry` honest. Without
+/// it, "return on *any* `Err`" passes the whole suite: the other reconnect test
+/// (`run_stream_reconnects_with_cursor`) reconnects after a clean EOF — which is
+/// `Ok(())`, not an error — so it cannot distinguish "retries errors" from "gives up on
+/// them". Only a failing *status* followed by a success can.
+///
+/// Uses a raw TCP listener rather than httpmock: httpmock's matchers are stateless, so
+/// making one path answer 503-then-200 requires fighting the library. Sequencing two
+/// accepts is simply what this test means.
+#[test]
+fn run_stream_retries_a_retryable_status_then_succeeds() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_srv = Arc::clone(&hits);
+
+    let body = sse_body(&[(Some("1"), "plan", &plan_event_json("prod", 1, "aaa"))]);
+
+    let server = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf); // drain the request head
+            let attempt = hits_srv.fetch_add(1, Ordering::SeqCst);
+            let response = if attempt == 0 {
+                // Transient: a live server having a bad moment.
+                "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                    .to_string()
+            } else {
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+            };
+            let _ = sock.write_all(response.as_bytes());
+            let _ = sock.flush();
+        }
+    });
+
+    let client = build_stream_client().unwrap();
+    let url = format!("http://{addr}/v1/events");
+    let mut received = Vec::new();
+
+    let result = run_stream(
+        &client,
+        &url,
+        None,
+        || false,
+        |ev| {
+            received.push(ev);
+            ControlFlow::Break(())
+        },
+    );
+
+    let _ = server.join();
+
+    assert!(result.is_ok(), "503 must be retried, got: {result:?}");
+    assert_eq!(received.len(), 1, "the event after the retry must arrive");
+    assert_eq!(received[0].sequence, 1);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "expected exactly two attempts (503 then 200) — one attempt means the 503 was treated as terminal"
+    );
+}

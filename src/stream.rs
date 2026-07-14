@@ -374,7 +374,7 @@ pub fn run_stream(
             return Ok(());
         }
 
-        if let Err(StreamError::Unsupported { .. }) = &result {
+        if result.is_err() {
             return result;
         }
 
