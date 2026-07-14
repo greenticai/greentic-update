@@ -348,7 +348,13 @@ fn run_stream_retries_a_retryable_status_then_succeeds() {
         },
     );
 
-    let _ = server.join();
+    // Deliberately NOT joined. The mock thread loops over two `accept()` calls; if the
+    // code under test regresses to "every error is terminal" it makes only ONE request,
+    // and joining would then block forever on the second accept — turning a regression
+    // into a hung CI job instead of a failing test. Everything asserted below is already
+    // observable without the join: `run_stream` has returned, so both requests it made
+    // have completed. The thread dies with the process.
+    drop(server);
 
     assert!(result.is_ok(), "503 must be retried, got: {result:?}");
     assert_eq!(received.len(), 1, "the event after the retry must arrive");
