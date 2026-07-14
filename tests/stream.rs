@@ -2,7 +2,9 @@
 
 //! Integration tests for the SSE stream transport against a mock server.
 
-use greentic_update::stream::{StreamError, UPDATE_EVENT_SCHEMA_V1, connect_and_read};
+use greentic_update::stream::{
+    StreamError, UPDATE_EVENT_SCHEMA_V1, build_stream_client, connect_and_read, run_stream,
+};
 use httpmock::prelude::*;
 use std::ops::ControlFlow;
 use std::panic;
@@ -52,7 +54,7 @@ fn two_plan_events_delivered_in_order() {
             .body(body);
     });
 
-    let client = greentic_update::stream::build_stream_client().unwrap();
+    let client = build_stream_client().unwrap();
     let url = format!("{}/v1/events", server.base_url());
     let mut received = Vec::new();
     connect_and_read(&client, &url, None, |ev| {
@@ -88,7 +90,7 @@ fn last_event_id_header_sent() {
             .body(body);
     });
 
-    let client = greentic_update::stream::build_stream_client().unwrap();
+    let client = build_stream_client().unwrap();
     let url = format!("{}/v1/events", server.base_url());
     let mut received = Vec::new();
     connect_and_read(&client, &url, Some(6), |ev| {
@@ -134,7 +136,7 @@ fn non_plan_event_and_wrong_schema_filtered_by_connect_and_read() {
             .body(body);
     });
 
-    let client = greentic_update::stream::build_stream_client().unwrap();
+    let client = build_stream_client().unwrap();
     let url = format!("{}/v1/events", server.base_url());
     let mut received = Vec::new();
     connect_and_read(&client, &url, None, |ev| {
@@ -161,7 +163,7 @@ fn non_2xx_returns_stream_error() {
         then.status(503).body("service unavailable");
     });
 
-    let client = greentic_update::stream::build_stream_client().unwrap();
+    let client = build_stream_client().unwrap();
     let url = format!("{}/v1/events", server.base_url());
     let err = connect_and_read(&client, &url, None, |_| ControlFlow::Continue(())).unwrap_err();
     mock.assert();
@@ -170,4 +172,90 @@ fn non_2xx_returns_stream_error() {
         matches!(err, StreamError::Status { status: 503 }),
         "unexpected error: {err:?}"
     );
+}
+
+// ── run_stream reconnect loop ──────────────────────────────────────
+
+#[test]
+fn run_stream_reconnects_with_cursor() {
+    let Some(server) = start_server() else {
+        eprintln!("skipping: unable to bind mock server in this environment");
+        return;
+    };
+
+    let ev1 = plan_event_json("prod", 7, "aaa");
+    let body1 = sse_body(&[(Some("7"), "plan", &ev1)]);
+
+    let ev2 = plan_event_json("prod", 8, "bbb");
+    let body2 = sse_body(&[(Some("8"), "plan", &ev2)]);
+
+    // First request: no Last-Event-ID header present.
+    let _mock1 = server.mock(|when, then| {
+        when.method(GET)
+            .path("/v1/events")
+            .header_missing("Last-Event-ID");
+        then.status(200)
+            .header("Content-Type", "text/event-stream")
+            .body(body1);
+    });
+
+    // Second request: must carry Last-Event-ID: 7.
+    let mock2 = server.mock(|when, then| {
+        when.method(GET)
+            .path("/v1/events")
+            .header("Last-Event-ID", "7");
+        then.status(200)
+            .header("Content-Type", "text/event-stream")
+            .body(body2);
+    });
+
+    let client = build_stream_client().unwrap();
+    let url = format!("{}/v1/events", server.base_url());
+    let mut received = Vec::new();
+
+    run_stream(
+        &client,
+        &url,
+        None,
+        || false,
+        |ev| {
+            received.push(ev);
+            if received.len() >= 2 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        },
+    )
+    .unwrap();
+
+    assert_eq!(received.len(), 2);
+    assert_eq!(received[0].sequence, 7);
+    assert_eq!(received[1].sequence, 8);
+    mock2.assert_calls(1);
+}
+
+#[test]
+fn run_stream_should_stop_ends_loop() {
+    let Some(server) = start_server() else {
+        eprintln!("skipping: unable to bind mock server in this environment");
+        return;
+    };
+
+    let ev = plan_event_json("prod", 1, "aaa");
+    let body = sse_body(&[(Some("1"), "plan", &ev)]);
+
+    let mock = server.mock(|when, then| {
+        when.method(GET).path("/v1/events");
+        then.status(200)
+            .header("Content-Type", "text/event-stream")
+            .body(body);
+    });
+
+    let client = build_stream_client().unwrap();
+    let url = format!("{}/v1/events", server.base_url());
+
+    run_stream(&client, &url, None, || true, |_| ControlFlow::Continue(())).unwrap();
+
+    mock.assert_calls(0);
 }

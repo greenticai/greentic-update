@@ -11,13 +11,13 @@
 //! .timeout(30s)`. In reqwest, `.timeout()` is a **total-request** timeout
 //! that includes body read. Reusing that client for an SSE stream kills the
 //! connection every 30 seconds, forever, presenting as a flaky server rather
-//! than a client bug. `build_stream_client` therefore disables the total
-//! timeout and sets only a connect timeout, so the long-lived body read is
-//! never artificially interrupted.
+//! than a client bug. `build_stream_client` therefore sets a long total
+//! timeout (10 minutes) that bounds "silently wedged" connections without
+//! cutting healthy streams, and a connect-only timeout for the handshake.
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Read};
 use std::ops::ControlFlow;
 use std::time::Duration;
 
@@ -32,6 +32,12 @@ pub const UPDATE_EVENT_SCHEMA_V1: &str = "greentic.update-event.v1";
 /// Maximum accumulated `data:` bytes per frame before the frame is discarded.
 /// Guards against a rogue or buggy server growing memory without bound.
 const MAX_FRAME_DATA_BYTES: usize = 64 * 1024;
+
+/// Maximum bytes in a single SSE line before it is treated as oversize and
+/// discarded.  The reader never buffers more than this + 1 bytes for any
+/// single line, so a server sending an unterminated multi-gigabyte line
+/// cannot OOM the runtime.
+const MAX_LINE_BYTES: usize = 64 * 1024;
 
 // ── Public types ────────────────────────────────────────────────────
 
@@ -125,16 +131,25 @@ impl Backoff {
 
 /// Build a dedicated blocking HTTP client for long-lived SSE streams.
 ///
-/// **DO NOT** reuse the caller's request client here. reqwest's `.timeout()`
+/// **DO NOT** reuse the caller's request client here.  reqwest's `.timeout()`
 /// is a *total-request* timeout that includes body read — a 30-second timeout
-/// kills the stream every 30 seconds, forever. This client sets NO total
-/// timeout and only a connect timeout so the long-lived body read proceeds
-/// uninterrupted. reqwest 0.13's blocking builder does not expose a separate
-/// read timeout, so idle-stream detection relies on the server's keepalive
-/// comments (`:` lines every ~20 s) and the OS TCP keepalive.
+/// kills the stream every 30 seconds, presenting as a flaky server.  But NO
+/// timeout at all (`.timeout(None)`) is equally dangerous: a proxy or server
+/// that keeps the TCP connection open while forwarding no application data
+/// wedges the read forever — `connect_and_read` never returns, so the
+/// consumer can never reconnect and push dies silently and permanently.
+///
+/// reqwest 0.13's blocking builder does **not** expose a separate
+/// `read_timeout` (only the async builder does), so this total-request
+/// timeout is the only lever.  **600 seconds** (10 minutes) is the sweet
+/// spot: it MUST stay far above the server's ~20 s keepalive interval so a
+/// healthy stream is never cut mid-frame, while bounding "silently wedged"
+/// from forever to ≤ 10 minutes.  Reconnecting is lossless because
+/// `Last-Event-ID` resumes from the cursor, so recycling costs one cheap
+/// request per 10 minutes at worst.
 pub fn build_stream_client() -> Result<reqwest::blocking::Client, StreamError> {
     reqwest::blocking::Client::builder()
-        .timeout(None) // no total-request timeout — the stream is unbounded
+        .timeout(Duration::from_secs(600))
         .connect_timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| StreamError::Http(e.to_string()))
@@ -152,15 +167,59 @@ pub fn build_stream_client() -> Result<reqwest::blocking::Client, StreamError> {
 /// - Multiple `data:` lines are joined with `\n`.
 /// - Frames whose accumulated data exceeds [`MAX_FRAME_DATA_BYTES`] are
 ///   discarded (not dispatched).
+///
+/// Each line is read with a bounded `read_until` capped at
+/// [`MAX_LINE_BYTES`], so a server sending an unterminated multi-gigabyte
+/// line cannot grow the reader's buffer past ~64 KiB.  Lines that exceed
+/// the cap are drained to the next newline in bounded chunks and the
+/// current frame is marked oversize.  Non-UTF-8 lines are silently
+/// skipped rather than erroring the stream.
 pub fn read_frames<R: BufRead>(
-    reader: R,
+    mut reader: R,
     mut on_frame: impl FnMut(SseFrame) -> ControlFlow<()>,
 ) -> io::Result<()> {
     let mut frame = SseFrame::default();
     let mut oversize = false;
+    let mut line_buf = Vec::with_capacity(1024);
 
-    for line_result in reader.lines() {
-        let line = line_result?;
+    loop {
+        line_buf.clear();
+        let n = reader
+            .by_ref()
+            .take(MAX_LINE_BYTES as u64 + 1)
+            .read_until(b'\n', &mut line_buf)?;
+        if n == 0 {
+            break;
+        }
+
+        if line_buf.len() > MAX_LINE_BYTES && !line_buf.ends_with(b"\n") {
+            loop {
+                let buf = reader.fill_buf()?;
+                if buf.is_empty() {
+                    break;
+                }
+                if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                    reader.consume(pos + 1);
+                    break;
+                }
+                let len = buf.len();
+                reader.consume(len);
+            }
+            oversize = true;
+            frame = SseFrame::default();
+            continue;
+        }
+
+        if line_buf.last() == Some(&b'\n') {
+            line_buf.pop();
+        }
+        if line_buf.last() == Some(&b'\r') {
+            line_buf.pop();
+        }
+
+        let Ok(line) = std::str::from_utf8(&line_buf) else {
+            continue;
+        };
 
         // Blank line → dispatch accumulated frame.
         if line.is_empty() {
@@ -269,7 +328,71 @@ pub fn connect_and_read(
     Ok(())
 }
 
-// ── Tests ───────────────────────────────────────────────────────────
+// ── Reconnect loop ─────────────────────────────────────────────
+
+/// Reconnecting SSE event loop that owns the resume cursor and backoff.
+///
+/// Each iteration calls [`connect_and_read`], advancing `cursor` to the
+/// highest `sequence` seen.  On any return (error, timeout, clean EOF):
+///
+/// 1. If `on_plan` returned [`ControlFlow::Break`], return `Ok(())`.
+/// 2. Reset the backoff if at least one event was delivered (a connection
+///    that fails immediately does **not** reset — this prevents a flapping
+///    server from resetting the backoff on every failed handshake).
+/// 3. If `should_stop()`, return `Ok(())`.
+/// 4. Sleep `Backoff::next_delay()`, then reconnect with the cursor as
+///    `Last-Event-ID`.
+///
+/// A timeout error from [`connect_and_read`] (fired by the 600 s total
+/// timeout set in [`build_stream_client`]) is treated as a normal
+/// reconnect — `Last-Event-ID` resumes losslessly.
+pub fn run_stream(
+    client: &reqwest::blocking::Client,
+    endpoint: &str,
+    from_sequence: Option<u64>,
+    should_stop: impl Fn() -> bool,
+    mut on_plan: impl FnMut(PlanEvent) -> ControlFlow<()>,
+) -> Result<(), StreamError> {
+    let mut cursor = from_sequence;
+    let mut backoff = Backoff::new(Duration::from_secs(60));
+
+    loop {
+        if should_stop() {
+            return Ok(());
+        }
+
+        let mut delivered_any = false;
+        let mut consumer_break = false;
+
+        let _ = connect_and_read(client, endpoint, cursor, |event| {
+            cursor = Some(cursor.map_or(event.sequence, |c| c.max(event.sequence)));
+            delivered_any = true;
+            match on_plan(event) {
+                ControlFlow::Continue(()) => ControlFlow::Continue(()),
+                ControlFlow::Break(()) => {
+                    consumer_break = true;
+                    ControlFlow::Break(())
+                }
+            }
+        });
+
+        if consumer_break {
+            return Ok(());
+        }
+
+        if delivered_any {
+            backoff.reset();
+        }
+
+        if should_stop() {
+            return Ok(());
+        }
+
+        std::thread::sleep(backoff.next_delay());
+    }
+}
+
+// ── Tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -592,5 +715,90 @@ mod tests {
         .unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].data, "real");
+    }
+
+    // ── Bounded line reader ────────────────────────────────────────
+
+    #[test]
+    fn unterminated_oversize_line_no_oom() {
+        let big = "x".repeat(1024 * 1024);
+        let mut frames = Vec::new();
+        read_frames(Cursor::new(big.as_bytes()), |f| {
+            frames.push(f);
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert!(frames.is_empty(), "no frame should be dispatched");
+    }
+
+    #[test]
+    fn oversize_line_resync_delivers_next_frame() {
+        let prefix = "x".repeat(MAX_LINE_BYTES);
+        let input = format!("event: {prefix}\ndata: wrong\n\ndata: ok\n\n");
+        let mut frames = Vec::new();
+        read_frames(Cursor::new(input.as_bytes()), |f| {
+            frames.push(f);
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert_eq!(
+            frames.len(),
+            1,
+            "the valid frame after the oversize line must be delivered"
+        );
+        assert_eq!(frames[0].data, "ok");
+    }
+
+    #[test]
+    fn line_at_exact_cap_accepted() {
+        let padding = "x".repeat(MAX_LINE_BYTES - 6); // "data: " is 6 bytes
+        let input = format!("data: {padding}\n\n");
+        let mut frames = Vec::new();
+        read_frames(Cursor::new(input.as_bytes()), |f| {
+            frames.push(f);
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert_eq!(
+            frames.len(),
+            1,
+            "a line of exactly MAX_LINE_BYTES must be accepted"
+        );
+        assert_eq!(frames[0].data.len(), MAX_LINE_BYTES - 6);
+    }
+
+    #[test]
+    fn line_at_cap_plus_one_skipped() {
+        let padding = "x".repeat(MAX_LINE_BYTES - 5); // total line = MAX_LINE_BYTES + 1
+        let input = format!("data: {padding}\n\ndata: ok\n\n");
+        let mut frames = Vec::new();
+        read_frames(Cursor::new(input.as_bytes()), |f| {
+            frames.push(f);
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert_eq!(frames.len(), 1, "the oversize frame must be skipped");
+        assert_eq!(frames[0].data, "ok");
+    }
+
+    #[test]
+    fn invalid_utf8_line_skipped_stream_continues() {
+        let mut input = Vec::new();
+        input.extend_from_slice(b"data: hello\n");
+        input.extend_from_slice(b"data: \xff\xfe\n");
+        input.extend_from_slice(b"\n");
+        input.extend_from_slice(b"data: world\n");
+        input.extend_from_slice(b"\n");
+
+        let mut frames = Vec::new();
+        read_frames(Cursor::new(&input[..]), |f| {
+            frames.push(f);
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].data, "hello");
+        assert_eq!(frames[1].data, "world");
     }
 }
