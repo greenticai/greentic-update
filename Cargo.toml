@@ -23,6 +23,9 @@ enroll = ["dep:reqwest", "dep:rcgen"]
 # Windows running-exe replacement via `self-replace`. OFF by default
 # to keep the lean build free of archive / compression deps.
 binswap = ["dep:tar", "dep:flate2", "dep:zip", "dep:self-replace"]
+# SSE (Server-Sent Events) transport for plan-update push notifications.
+# Reuses the existing `reqwest` dep with the `blocking` feature added.
+stream = ["dep:reqwest", "reqwest/blocking"]
 
 [dependencies]
 # Only the (ungated) `signing` module is used today (DistClient lands with the
