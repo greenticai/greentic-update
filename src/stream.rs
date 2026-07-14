@@ -15,6 +15,8 @@
 //! timeout and sets only a connect timeout, so the long-lived body read is
 //! never artificially interrupted.
 
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
 use std::io::{self, BufRead};
 use std::ops::ControlFlow;
 use std::time::Duration;
@@ -77,14 +79,21 @@ pub enum StreamError {
 pub struct Backoff {
     max: Duration,
     current: Duration,
+    /// Per-instance seed derived from `RandomState` so that concurrent
+    /// processes jitter independently without a PRNG dependency.
+    jitter_seed: u64,
 }
 
 impl Backoff {
     /// Create a new backoff starting at 1 second, capped at `max`.
     pub fn new(max: Duration) -> Self {
+        // `RandomState::new()` is seeded per-process from the OS, so each
+        // `Backoff` instance gets an independent jitter seed.
+        let seed = RandomState::new().build_hasher().finish();
         Self {
             max,
             current: Duration::from_secs(1),
+            jitter_seed: seed,
         }
     }
 
@@ -100,10 +109,14 @@ impl Backoff {
     pub fn next_delay(&mut self) -> Duration {
         let base = self.current.min(self.max);
         self.current = (self.current * 2).min(self.max);
-        // Deterministic-ish jitter: use the nanosecond fraction of the base as
-        // a poor-man's random without pulling in a PRNG dep.
-        let jitter_nanos = (base.as_nanos() % 4) * (base.as_nanos() / 4);
-        let jitter = Duration::from_nanos((jitter_nanos % (base.as_millis() * 250_000 + 1)) as u64);
+        // Mix the per-instance seed with the current step to produce jitter
+        // that varies across processes without pulling in a PRNG crate.
+        self.jitter_seed = self
+            .jitter_seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1);
+        let frac = (self.jitter_seed >> 33) % 250; // 0..249 → 0.0%..24.9%
+        let jitter = base * frac as u32 / 1000;
         base + jitter
     }
 }
@@ -472,18 +485,43 @@ mod tests {
     // ── Backoff ─────────────────────────────────────────────────────
 
     #[test]
-    fn backoff_grows_monotonically_and_is_capped() {
+    fn backoff_grows_exponentially_and_is_capped() {
         let max = Duration::from_secs(30);
         let mut b = Backoff::new(max);
-        let mut prev = Duration::ZERO;
+        let mut delays = Vec::new();
         for _ in 0..20 {
-            let d = b.next_delay();
-            assert!(d >= prev || d <= max, "delay must grow or be at cap");
+            delays.push(b.next_delay());
+        }
+        // The first few base values are 1, 2, 4, 8, 16 (before hitting cap).
+        // With up to 25% jitter, delay N must be >= its base (no negative jitter)
+        // and delay after 3 calls must exceed 4 s (proves doubling).
+        assert!(
+            delays[0] >= Duration::from_secs(1),
+            "first delay too low: {:?}",
+            delays[0]
+        );
+        assert!(
+            delays[2] >= Duration::from_secs(4),
+            "third delay must be >= 4s (base 4s + jitter): {:?}",
+            delays[2]
+        );
+        // All delays must stay within cap + 25% jitter headroom.
+        for d in &delays {
             assert!(
-                d <= max + max / 4,
-                "delay must not exceed cap + jitter headroom"
+                *d <= max + max / 4,
+                "delay must not exceed cap + jitter headroom: {d:?}"
             );
-            prev = d;
+        }
+        // The first 4 steps (bases 1, 2, 4, 8) must be strictly increasing.
+        for i in 0..4 {
+            assert!(
+                delays[i + 1] > delays[i],
+                "delays[{}]={:?} must be < delays[{}]={:?}",
+                i,
+                delays[i],
+                i + 1,
+                delays[i + 1]
+            );
         }
     }
 

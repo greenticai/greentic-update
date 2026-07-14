@@ -103,6 +103,53 @@ fn last_event_id_header_sent() {
 }
 
 #[test]
+fn non_plan_event_and_wrong_schema_filtered_by_connect_and_read() {
+    let Some(server) = start_server() else {
+        eprintln!("skipping: unable to bind mock server in this environment");
+        return;
+    };
+
+    let v1_plan = plan_event_json("prod", 3, "ddd");
+    // heartbeat event with valid PlanEvent JSON -- must be filtered by event type.
+    let heartbeat_json = plan_event_json("prod", 1, "aaa");
+    // plan event with v2 schema -- must be filtered by schema check.
+    let v2_plan = serde_json::to_string(&serde_json::json!({
+        "schema": "greentic.update-event.v2",
+        "env_id": "prod",
+        "sequence": 2,
+        "plan_sha256": "bbb",
+    }))
+    .unwrap();
+
+    let body = sse_body(&[
+        (Some("1"), "heartbeat", &heartbeat_json),
+        (Some("2"), "plan", &v2_plan),
+        (Some("3"), "plan", &v1_plan),
+    ]);
+
+    let mock = server.mock(|when, then| {
+        when.method(GET).path("/v1/events");
+        then.status(200)
+            .header("Content-Type", "text/event-stream")
+            .body(body);
+    });
+
+    let client = greentic_update::stream::build_stream_client().unwrap();
+    let url = format!("{}/v1/events", server.base_url());
+    let mut received = Vec::new();
+    connect_and_read(&client, &url, None, |ev| {
+        received.push(ev);
+        ControlFlow::Continue(())
+    })
+    .unwrap();
+    mock.assert();
+
+    assert_eq!(received.len(), 1, "only the v1 plan event should pass");
+    assert_eq!(received[0].env_id, "prod");
+    assert_eq!(received[0].sequence, 3);
+}
+
+#[test]
 fn non_2xx_returns_stream_error() {
     let Some(server) = start_server() else {
         eprintln!("skipping: unable to bind mock server in this environment");
