@@ -259,3 +259,27 @@ fn run_stream_should_stop_ends_loop() {
 
     mock.assert_calls(0);
 }
+
+#[test]
+fn run_stream_404_is_terminal_no_retry() {
+    let Some(server) = start_server() else {
+        eprintln!("skipping: unable to bind mock server in this environment");
+        return;
+    };
+
+    let mock = server.mock(|when, then| {
+        when.method(GET).path("/v1/events");
+        then.status(404).body("not found");
+    });
+
+    let client = build_stream_client().unwrap();
+    let url = format!("{}/v1/events", server.base_url());
+
+    let err = run_stream(&client, &url, None, || false, |_| ControlFlow::Continue(())).unwrap_err();
+
+    assert!(
+        matches!(err, StreamError::Unsupported { status: 404 }),
+        "expected Unsupported(404), got: {err:?}"
+    );
+    mock.assert_calls(1);
+}

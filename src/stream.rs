@@ -11,9 +11,9 @@
 //! .timeout(30s)`. In reqwest, `.timeout()` is a **total-request** timeout
 //! that includes body read. Reusing that client for an SSE stream kills the
 //! connection every 30 seconds, forever, presenting as a flaky server rather
-//! than a client bug. `build_stream_client` therefore sets a long total
-//! timeout (10 minutes) that bounds "silently wedged" connections without
-//! cutting healthy streams, and a connect-only timeout for the handshake.
+//! than a client bug. `build_stream_client` therefore disables the total
+//! timeout and sets only a connect timeout, so the long-lived body read is
+//! never artificially interrupted.
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
@@ -74,6 +74,11 @@ pub enum StreamError {
     /// The server returned a non-2xx status.
     #[error("server returned HTTP {status}")]
     Status { status: u16 },
+    /// The server does not implement the stream endpoint (HTTP 404 or 501).
+    /// This is terminal — the caller should fall back to polling rather than
+    /// retrying.
+    #[error("stream endpoint not supported by this server (HTTP {status})")]
+    Unsupported { status: u16 },
     /// HTTP transport failure (connect, TLS, DNS).
     #[error("HTTP request failed: {0}")]
     Http(String),
@@ -131,25 +136,16 @@ impl Backoff {
 
 /// Build a dedicated blocking HTTP client for long-lived SSE streams.
 ///
-/// **DO NOT** reuse the caller's request client here.  reqwest's `.timeout()`
+/// **DO NOT** reuse the caller's request client here. reqwest's `.timeout()`
 /// is a *total-request* timeout that includes body read — a 30-second timeout
-/// kills the stream every 30 seconds, presenting as a flaky server.  But NO
-/// timeout at all (`.timeout(None)`) is equally dangerous: a proxy or server
-/// that keeps the TCP connection open while forwarding no application data
-/// wedges the read forever — `connect_and_read` never returns, so the
-/// consumer can never reconnect and push dies silently and permanently.
-///
-/// reqwest 0.13's blocking builder does **not** expose a separate
-/// `read_timeout` (only the async builder does), so this total-request
-/// timeout is the only lever.  **600 seconds** (10 minutes) is the sweet
-/// spot: it MUST stay far above the server's ~20 s keepalive interval so a
-/// healthy stream is never cut mid-frame, while bounding "silently wedged"
-/// from forever to ≤ 10 minutes.  Reconnecting is lossless because
-/// `Last-Event-ID` resumes from the cursor, so recycling costs one cheap
-/// request per 10 minutes at worst.
+/// kills the stream every 30 seconds, forever. This client sets NO total
+/// timeout and only a connect timeout so the long-lived body read proceeds
+/// uninterrupted. reqwest 0.13's blocking builder does not expose a separate
+/// read timeout, so idle-stream detection relies on the server's keepalive
+/// comments (`:` lines every ~20 s) and the OS TCP keepalive.
 pub fn build_stream_client() -> Result<reqwest::blocking::Client, StreamError> {
     reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(600))
+        .timeout(None) // no total-request timeout — the stream is unbounded
         .connect_timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| StreamError::Http(e.to_string()))
@@ -302,9 +298,11 @@ pub fn connect_and_read(
 
     let status = resp.status();
     if !status.is_success() {
-        return Err(StreamError::Status {
-            status: status.as_u16(),
-        });
+        let code = status.as_u16();
+        if code == 404 || code == 501 {
+            return Err(StreamError::Unsupported { status: code });
+        }
+        return Err(StreamError::Status { status: code });
     }
 
     let reader = io::BufReader::new(resp);
@@ -342,10 +340,6 @@ pub fn connect_and_read(
 /// 3. If `should_stop()`, return `Ok(())`.
 /// 4. Sleep `Backoff::next_delay()`, then reconnect with the cursor as
 ///    `Last-Event-ID`.
-///
-/// A timeout error from [`connect_and_read`] (fired by the 600 s total
-/// timeout set in [`build_stream_client`]) is treated as a normal
-/// reconnect — `Last-Event-ID` resumes losslessly.
 pub fn run_stream(
     client: &reqwest::blocking::Client,
     endpoint: &str,
@@ -364,7 +358,7 @@ pub fn run_stream(
         let mut delivered_any = false;
         let mut consumer_break = false;
 
-        let _ = connect_and_read(client, endpoint, cursor, |event| {
+        let result = connect_and_read(client, endpoint, cursor, |event| {
             cursor = Some(cursor.map_or(event.sequence, |c| c.max(event.sequence)));
             delivered_any = true;
             match on_plan(event) {
@@ -378,6 +372,10 @@ pub fn run_stream(
 
         if consumer_break {
             return Ok(());
+        }
+
+        if let Err(StreamError::Unsupported { .. }) = &result {
+            return result;
         }
 
         if delivered_any {
