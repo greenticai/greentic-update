@@ -11,9 +11,12 @@
 //! .timeout(30s)`. In reqwest, `.timeout()` is a **total-request** timeout
 //! that includes body read. Reusing that client for an SSE stream kills the
 //! connection every 30 seconds, forever, presenting as a flaky server rather
-//! than a client bug. `build_stream_client` therefore disables the total
-//! timeout and sets only a connect timeout, so the long-lived body read is
-//! never artificially interrupted.
+//! than a client bug. `build_stream_client` therefore sets its own, *long* bound
+//! — [`STREAM_CONNECTION_MAX_SECS`] — which recycles the connection rather than
+//! interrupting it, and reconnects resume losslessly from `Last-Event-ID`. Some
+//! bound has to exist: without one, an intermediary that stays TCP-responsive
+//! while it stops forwarding data parks the read forever, and push never
+//! recovers. See [`build_stream_client`] for the full argument.
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
@@ -134,21 +137,76 @@ impl Backoff {
 
 // ── Client construction ─────────────────────────────────────────────
 
+/// How long one stream connection may live before it is recycled.
+///
+/// This is a reqwest *total-request* timeout, so it caps the connection whether or
+/// not it is healthy. That is the point — see [`build_stream_client`] for why a
+/// bound must exist at all.
+///
+/// It MUST stay far above the server's ~20 s keepalive interval: a value near it
+/// would cut healthy streams mid-frame and turn this transport into a reconnect
+/// storm. Fifteen minutes costs ~96 cheap reconnects per environment per day, and
+/// each resumes losslessly from `Last-Event-ID`.
+pub const STREAM_CONNECTION_MAX_SECS: u64 = 900;
+
+/// Compile-time guard on the constant above. The server sends `: keepalive` comments
+/// every ~20 s; a recycle interval anywhere near that would cut healthy streams
+/// mid-frame and turn this transport into a reconnect storm — precisely the bug a
+/// *short* `.timeout()` causes. This is a `const` assertion rather than a test on
+/// purpose: it fails the **build**, and it cannot be deleted alongside the code it
+/// guards the way a test can.
+const _: () = assert!(
+    STREAM_CONNECTION_MAX_SECS >= 300,
+    "stream recycle interval must stay far above the server's ~20s keepalive"
+);
+
+/// A connection that stayed up at least this long counts as healthy, so the backoff
+/// resets even if it carried no events.
+///
+/// Without this, [`STREAM_CONNECTION_MAX_SECS`] recycling would inflate the backoff
+/// on every cycle: a *healthy but idle* stream delivers no events for fifteen
+/// minutes, so a `delivered_any`-only reset rule would score each recycle as a
+/// failure and walk the delay up to its cap. The floor must also stay well above
+/// zero, or a server that accepts a connection and instantly drops it would reset
+/// the backoff on every flap and spin.
+const BACKOFF_RESET_AFTER: Duration = Duration::from_secs(30);
+
 /// Build a dedicated blocking HTTP client for long-lived SSE streams.
 ///
-/// **DO NOT** reuse the caller's request client here. reqwest's `.timeout()`
-/// is a *total-request* timeout that includes body read — a 30-second timeout
-/// kills the stream every 30 seconds, forever. This client sets NO total
-/// timeout and only a connect timeout so the long-lived body read proceeds
-/// uninterrupted. reqwest 0.13's blocking builder does not expose a separate
-/// read timeout, so idle-stream detection relies on the server's keepalive
-/// comments (`:` lines every ~20 s) and the OS TCP keepalive.
+/// **DO NOT** reuse the caller's request client here. reqwest's `.timeout()` is a
+/// *total-request* timeout that includes body read, so the caller's 30-second
+/// request timeout would kill the stream every 30 seconds, forever. Any *short*
+/// value here is that same bug.
+///
+/// A bound must still exist, because the alternative is worse. reqwest 0.13's
+/// blocking builder exposes no read timeout (only the async builder does), and the
+/// TCP keepalive reqwest enables by default (15 s) only detects a peer that has
+/// stopped answering at the *TCP* layer — a dead server, a dropped NAT mapping, a
+/// partitioned network. It does **not** detect an intermediary that stays
+/// TCP-responsive while it silently stops forwarding application data. There, a
+/// blocking read on this socket parks forever: `connect_and_read` never returns, so
+/// `run_stream` never reconnects, and push is dead for this environment until the
+/// process restarts. The fallback poll would still converge the environment, but the
+/// stream would never come back on its own.
+///
+/// So: no *short* timeout, but a long one — [`STREAM_CONNECTION_MAX_SECS`]. It
+/// recycles the connection, bounding "silently wedged" from forever down to one
+/// recycle interval, and reconnects resume losslessly from `Last-Event-ID`.
 pub fn build_stream_client() -> Result<reqwest::blocking::Client, StreamError> {
     reqwest::blocking::Client::builder()
-        .timeout(None) // no total-request timeout — the stream is unbounded
+        .timeout(Duration::from_secs(STREAM_CONNECTION_MAX_SECS))
         .connect_timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| StreamError::Http(e.to_string()))
+}
+
+/// Whether a finished connection counts as healthy enough to reset the backoff.
+///
+/// A pure function so the rule is testable on its own: the interaction it guards —
+/// recycling an idle stream must not inflate the backoff — is otherwise observable
+/// only after fifteen minutes of wall-clock.
+fn resets_backoff(delivered_any: bool, uptime: Duration) -> bool {
+    delivered_any || uptime >= BACKOFF_RESET_AFTER
 }
 
 // ── Frame parsing ───────────────────────────────────────────────────
@@ -355,6 +413,7 @@ pub fn run_stream(
             return Ok(());
         }
 
+        let started = std::time::Instant::now();
         let mut delivered_any = false;
         let mut consumer_break = false;
 
@@ -374,11 +433,17 @@ pub fn run_stream(
             return Ok(());
         }
 
-        if result.is_err() {
+        // Only "this server has no stream endpoint" is terminal. Every other error —
+        // connect failure, recycle timeout, read error, 5xx — is a live server having
+        // a bad moment, and must be retried.
+        if let Err(StreamError::Unsupported { .. }) = &result {
             return result;
         }
 
-        if delivered_any {
+        // A recycled long-lived connection is a success, not a failure — see
+        // `resets_backoff`. Keying this on `delivered_any` alone would walk the
+        // reconnect delay up to its cap on a perfectly healthy idle stream.
+        if resets_backoff(delivered_any, started.elapsed()) {
             backoff.reset();
         }
 
@@ -601,6 +666,37 @@ mod tests {
         .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].env_id, "b");
+    }
+
+    // ── Connection recycling / backoff reset rule ───────────────────
+
+    #[test]
+    fn a_recycled_idle_connection_resets_the_backoff() {
+        // Why this rule exists. STREAM_CONNECTION_MAX_SECS recycles even a perfectly
+        // healthy stream, and a healthy stream can carry zero events for its whole
+        // life. Keyed on `delivered_any` alone, every recycle would look like a
+        // failure and walk the reconnect delay up to its cap — push latency would
+        // decay to minutes on an environment where nothing is wrong.
+        assert!(resets_backoff(false, Duration::from_secs(900)));
+        assert!(resets_backoff(false, BACKOFF_RESET_AFTER));
+    }
+
+    #[test]
+    fn a_flapping_server_does_not_reset_the_backoff() {
+        // The decoy for the test above: "just always reset" must not pass it. A
+        // server that accepts a connection and instantly drops it would otherwise
+        // reset the backoff on every flap and spin at the floor delay forever.
+        assert!(!resets_backoff(false, Duration::ZERO));
+        assert!(!resets_backoff(
+            false,
+            BACKOFF_RESET_AFTER - Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn delivering_an_event_resets_the_backoff_however_brief() {
+        // A connection that delivered a plan did its job, even if it died right after.
+        assert!(resets_backoff(true, Duration::ZERO));
     }
 
     // ── Backoff ─────────────────────────────────────────────────────
