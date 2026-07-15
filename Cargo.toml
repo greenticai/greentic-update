@@ -58,7 +58,7 @@ chrono = { version = "0.4", default-features = false, features = ["serde", "cloc
 # → rename atomic-write pattern. Both are small, filesystem-only deps — the
 # crate's leanness invariant is "no `greentic-deploy-spec` dep", not "no I/O
 # deps"; on-disk staging inherently needs these.
-fs4 = "0.13"
+fs4 = "1.1"
 tempfile = "3"
 hex = "0.4"
 rcgen = { version = "0.14", optional = true, default-features = false, features = ["pem", "ring"] }
