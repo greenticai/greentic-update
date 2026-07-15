@@ -1,9 +1,10 @@
 [package]
 name = "greentic-update"
-# TWO-LANE. `main` publishes stable 1.1.x; `develop` publishes 1.1.0-dev.<RUN_ID>
-# (re-armed from the old single-lane 0.1.x scheme). See the dependency note
-# below for why one crate cannot serve both lanes from a single publish.
-version = "1.1.0-dev.0"
+# TWO-LANE. `main` publishes stable 1.1.x; `develop` publishes 1.2.0-dev.<RUN_ID>
+# (standard fleet dev lane — 1.1 stable vs 1.2 dev keeps the two lanes on distinct
+# minors). See the dependency note below for why one crate cannot serve both lanes
+# from a single publish.
+version = "1.2.0-dev.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic update platform foundation: signed update plans, installed-artifact catalogue/diff, staging, and airgap envelopes."
