@@ -5,7 +5,7 @@ name = "greentic-update"
 # (`greentic-start@main` pins `>=1.1.0, <1.2.0-0`; `greentic-deployer@develop`
 # pins `>=0.1.x, <0.2`). See the dependency note below for why one crate cannot
 # serve both lanes from a single publish.
-version = "1.1.0"
+version = "1.3.0-research.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic update platform foundation: signed update plans, installed-artifact catalogue/diff, staging, and airgap envelopes."
@@ -51,7 +51,7 @@ stream = ["dep:reqwest", "reqwest/blocking"]
 # on this crate could not intersect, so every newer `greentic-update` became
 # unresolvable for the stable fleet. Nothing here needs a 1.2-only surface — the
 # crate builds and tests clean against 1.1.3.
-greentic-distributor-client = ">=1.1.0-0, <1.2.0-0"
+greentic-distributor-client = ">=1.3.0-research.0, <1.4.0-0"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 # Staging FSM (ungated `staging` module): `fs4` for the per-env `.lock` flock and
 # the independent per-file audit-log flock; `tempfile` for the write-tmp → fsync
