@@ -48,6 +48,48 @@ pub const UPDATE_PLAN_SCHEMA_V1: &str = "greentic.update-plan.v1";
 /// under a different predicate type (type confusion).
 pub const UPDATE_PLAN_PREDICATE_TYPE_V1: &str = "greentic.update-plan-predicate.v1";
 
+/// Reserved environment id naming the **fleet broadcast channel**: a plan whose
+/// [`UpdatePlan::env_id`] is `_` is addressed to every environment that
+/// subscribes to it, not to one named environment.
+///
+/// It is the environment-id half of the default plan endpoint
+/// (`https://updates.greentic.cloud/v1/environments/_/plan`) — the channel an
+/// environment subscribes to when its manifest declares `updates` without
+/// naming one. `_` is already the fleet's placeholder identifier (secrets URIs
+/// use it for the default team) and is legal under `validate_identifier`, so it
+/// cannot collide with a real environment id: an operator who literally names
+/// an environment `_` is on the broadcast channel by construction.
+///
+/// **This constant only decides *addressing*.** A broadcast plan converges every
+/// subscriber at once, so what it is allowed to *carry* is a separate, much
+/// narrower question, enforced by the applier (`greentic-deployer`), which owns
+/// the env-manifest type this crate deliberately keeps opaque.
+///
+/// **One channel per environment.** [`UpdatePlan::sequence`] is monotonic *per
+/// channel*, and the broadcast channel counts independently of any per-env one.
+/// An environment that consumed both would compare sequences across two
+/// unrelated counters and reject the lower as a downgrade. Nothing enforces
+/// this today because an environment resolves exactly one `plan_endpoint`;
+/// anything that adds a second must first reconcile the sequence spaces.
+pub const BROADCAST_ENV_ID: &str = "_";
+
+/// Whether a plan addressed to `plan_env` should be accepted by the environment
+/// `local_env` — an exact match, or the fleet broadcast channel.
+///
+/// The single definition of plan→environment addressing. Both the operator CLI
+/// and the runtime match on it, and a divergence between them does not fail
+/// loudly: one side would silently ignore plans the other applies. Keep it here,
+/// next to [`UpdatePlan::env_id`], rather than re-deriving `== "_"` at each call
+/// site.
+///
+/// Deliberately **not** symmetric: `local_env == "_"` is not a wildcard that
+/// swallows every plan. An environment literally named `_` accepts only plans
+/// addressed to `_`, which is exactly the exact-match arm.
+#[must_use]
+pub fn plan_targets_env(plan_env: &str, local_env: &str) -> bool {
+    plan_env == local_env || plan_env == BROADCAST_ENV_ID
+}
+
 /// The full update plan document — the canonical artifact whose SHA-256 the
 /// DSSE subject pins.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1080,5 +1122,35 @@ mod tests {
         let err =
             select_binary(&bins, "gtc", "x86_64-unknown-linux-gnu").expect_err("duplicate pair");
         assert!(matches!(err, PlanError::AmbiguousBinary { count: 2, .. }));
+    }
+
+    #[test]
+    fn plan_targets_env_matches_exactly_or_by_broadcast() {
+        // Exact match.
+        assert!(plan_targets_env("prod", "prod"));
+        assert!(!plan_targets_env("prod", "staging"));
+
+        // The broadcast channel reaches every environment.
+        assert!(plan_targets_env(BROADCAST_ENV_ID, "prod"));
+        assert!(plan_targets_env(BROADCAST_ENV_ID, "staging"));
+        assert!(plan_targets_env(BROADCAST_ENV_ID, BROADCAST_ENV_ID));
+
+        // ...but only in that direction: a local env named `_` is still an
+        // ordinary environment and must not accept `prod`'s plans.
+        assert!(!plan_targets_env("prod", BROADCAST_ENV_ID));
+    }
+
+    #[test]
+    fn broadcast_id_is_not_matched_by_lookalikes() {
+        // The wildcard is the exact string `_`, not a prefix, a substring, or a
+        // trimmed form: a plan addressed to `__` or ` _ ` is addressed to an
+        // environment that (almost certainly) does not exist, and must be
+        // rejected rather than quietly broadcast to the whole fleet.
+        for lookalike in ["__", "_ ", " _", "", "*", "_prod", "prod_"] {
+            assert!(
+                !plan_targets_env(lookalike, "prod"),
+                "`{lookalike}` must not act as the broadcast id"
+            );
+        }
     }
 }
