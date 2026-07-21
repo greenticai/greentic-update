@@ -54,7 +54,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::plan::{PlanArtifact, VerifiedUpdatePlan};
+use crate::plan::{PlanArtifact, VerifiedUpdatePlan, plan_targets_env};
 
 /// Environment variable overriding the updates root directory.
 pub const UPDATES_DIR_VAR: &str = "GREENTIC_UPDATES_DIR";
@@ -531,9 +531,10 @@ impl UpdatesRoot {
         Ok(handle)
     }
 
-    /// Reject a plan whose `env_id` does not match this root.
+    /// Reject a plan this root is not addressed by — an exact `env_id` match or
+    /// the fleet broadcast channel (see [`plan_targets_env`]).
     fn check_targets_env(&self, plan: &crate::plan::UpdatePlan) -> Result<(), StagingError> {
-        if plan.env_id != self.env_id {
+        if !plan_targets_env(&plan.env_id, &self.env_id) {
             return Err(StagingError::EnvMismatch {
                 plan_env: plan.env_id.clone(),
                 root_env: self.env_id.clone(),
@@ -1394,7 +1395,9 @@ fn append_audit(env_dir: &Path, event: &UpdateAuditEvent) -> Result<(), StagingE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::{CompatRequirements, OnFail, RollbackKind, RollbackPolicy, UpdatePlan};
+    use crate::plan::{
+        BROADCAST_ENV_ID, CompatRequirements, OnFail, RollbackKind, RollbackPolicy, UpdatePlan,
+    };
     use std::convert::Infallible;
     use tempfile::TempDir;
 
@@ -1557,6 +1560,38 @@ mod tests {
             root.begin(&wrong, b"p", b"s"),
             Err(StagingError::EnvMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn begin_admits_a_broadcast_plan_into_any_env() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        let bcast = verified(plan_with("plan-b", BROADCAST_ENV_ID, 1, vec![]));
+
+        let staged = root.begin(&bcast, b"p", b"s").unwrap();
+
+        // The staged marker records the LOCAL env, not the plan's `_`: the
+        // broadcast id is an address, not an identity. If this ever recorded
+        // `_`, every env's staging tree would claim to be the broadcast env and
+        // the per-env downgrade sequence would be shared across the fleet.
+        assert_eq!(staged.state().unwrap().env_id, "prod");
+    }
+
+    #[test]
+    fn broadcast_id_is_not_a_wildcard_in_the_local_direction() {
+        // An environment literally named `_` must not swallow plans addressed to
+        // other environments — the wildcard is one-directional.
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), BROADCAST_ENV_ID).unwrap();
+        let foreign = verified(plan_with("plan-x", "prod", 1, vec![]));
+        assert!(matches!(
+            root.begin(&foreign, b"p", b"s"),
+            Err(StagingError::EnvMismatch { .. })
+        ));
+
+        // ...but it does accept broadcast plans, via the exact-match arm.
+        let bcast = verified(plan_with("plan-b", BROADCAST_ENV_ID, 1, vec![]));
+        assert!(root.begin(&bcast, b"p", b"s").is_ok());
     }
 
     // Drive a freshly-begun plan all the way to `Applied` (for admission tests).

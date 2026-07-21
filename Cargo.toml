@@ -5,7 +5,7 @@ name = "greentic-update"
 # (`greentic-start@main` pins `>=1.1.0, <1.2.0-0`; `greentic-deployer@develop`
 # pins `>=0.1.x, <0.2`). See the dependency note below for why one crate cannot
 # serve both lanes from a single publish.
-version = "1.1.0"
+version = "1.1.1"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic update platform foundation: signed update plans, installed-artifact catalogue/diff, staging, and airgap envelopes."
