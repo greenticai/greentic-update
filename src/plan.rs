@@ -65,12 +65,27 @@ pub const UPDATE_PLAN_PREDICATE_TYPE_V1: &str = "greentic.update-plan-predicate.
 /// narrower question, enforced by the applier (`greentic-deployer`), which owns
 /// the env-manifest type this crate deliberately keeps opaque.
 ///
-/// **One channel per environment.** [`UpdatePlan::sequence`] is monotonic *per
-/// channel*, and the broadcast channel counts independently of any per-env one.
-/// An environment that consumed both would compare sequences across two
-/// unrelated counters and reject the lower as a downgrade. Nothing enforces
-/// this today because an environment resolves exactly one `plan_endpoint`;
-/// anything that adds a second must first reconcile the sequence spaces.
+/// **One channel per environment, for the whole life of the environment.**
+/// [`UpdatePlan::sequence`] is monotonic *per channel*, and the broadcast
+/// channel counts independently of any per-env one. The downgrade guard
+/// ([`ensure_not_downgrade`]) compares an incoming plan against the highest
+/// sequence applied to the environment *from any source* — `StageState` records
+/// no channel — so two counters in one staging tree are indistinguishable.
+///
+/// This bites on **sequential migration**, not just simultaneous consumption:
+/// repointing an environment's `plan_endpoint` from a per-env channel at
+/// sequence `N` to the broadcast channel at `M < N` leaves the old channel's
+/// applied history in place, and every broadcast plan is refused as a downgrade
+/// until the broadcast counter passes `N`. The reverse is worse — a fleet-wide
+/// broadcast counter outruns any single environment's, so a broadcast→per-env
+/// switch can wedge effectively forever. The failure is silent and per-poll:
+/// the plan fetches and verifies, then loses at admission.
+///
+/// So an environment must stay on the channel it starts on. Nothing enforces
+/// that. Giving `StageState` a channel field and computing downgrade facts per
+/// channel — or defining one shared sequence space plus a tested migration
+/// procedure — is the real fix, and is deliberately out of scope here: it
+/// changes the on-disk staging schema, which this addressing change does not.
 pub const BROADCAST_ENV_ID: &str = "_";
 
 /// Whether a plan addressed to `plan_env` should be accepted by the environment
