@@ -567,10 +567,19 @@ impl UpdatesRoot {
         let applied: Vec<StageState> = self
             .scan_plans(true)?
             .into_iter()
-            .filter(|s| s.stage == UpdateStage::Applied && s.channel.as_deref() == Some(channel))
+            .filter(|s| s.stage == UpdateStage::Applied)
             .collect();
         Ok(AdmissionFacts {
-            latest_applied_sequence: applied.iter().map(|s| s.sequence).max(),
+            // The downgrade watermark is per-channel: a plan only downgrades
+            // against plans applied from the SAME channel, so a per-env and the
+            // broadcast (`_`) channel count independently.
+            latest_applied_sequence: applied
+                .iter()
+                .filter(|s| s.channel.as_deref() == Some(channel))
+                .map(|s| s.sequence)
+                .max(),
+            // `requires` is an environment-wide prerequisite ("was plan X ever
+            // applied to this env?"), NOT channel-scoped — keep every applied id.
             applied_plan_ids: applied.into_iter().map(|s| s.plan_id).collect(),
         })
     }
@@ -606,10 +615,16 @@ impl UpdatesRoot {
             .map(|s| s.plan_id.clone());
         let applied: Vec<&StageState> = states
             .iter()
-            .filter(|s| s.stage == UpdateStage::Applied && s.channel.as_deref() == Some(channel))
+            .filter(|s| s.stage == UpdateStage::Applied)
             .collect();
         let facts = AdmissionFacts {
-            latest_applied_sequence: applied.iter().map(|s| s.sequence).max(),
+            // Per-channel downgrade watermark (see `admission_facts_locked`).
+            latest_applied_sequence: applied
+                .iter()
+                .filter(|s| s.channel.as_deref() == Some(channel))
+                .map(|s| s.sequence)
+                .max(),
+            // Env-wide applied ids for `requires` (cross-channel prerequisites).
             applied_plan_ids: applied.iter().map(|s| s.plan_id.clone()).collect(),
         };
         Ok((applying, facts))
@@ -827,6 +842,15 @@ impl UpdatesRoot {
     /// The highest `sequence` among plans that reached [`UpdateStage::Applied`],
     /// or `None` if none have. Feeds the caller's downgrade guard
     /// ([`crate::plan::ensure_not_downgrade`]).
+    ///
+    /// **Aggregates across ALL channels** — this is a convenience query, NOT the
+    /// per-channel watermark the checked admission paths ([`begin_checked`] /
+    /// [`begin_apply_checked`]) enforce. A caller that mixes broadcast (`_`) and
+    /// per-env plans must not use this as the authoritative downgrade guard, or it
+    /// re-opens the channel-migration wedge; go through the checked entry points.
+    ///
+    /// [`begin_checked`]: Self::begin_checked
+    /// [`begin_apply_checked`]: Self::begin_apply_checked
     pub fn latest_applied_sequence(&self) -> Result<Option<u64>, StagingError> {
         Ok(self
             .list()?
@@ -2676,6 +2700,33 @@ mod tests {
         let back: StageState = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back.channel, Some("_".to_string()));
         assert_eq!(state, back);
+    }
+
+    #[test]
+    fn applied_plan_ids_stay_env_wide_across_channels() {
+        // The downgrade watermark is per-channel, but `requires` is an
+        // environment-wide prerequisite. A broadcast admission must therefore
+        // still see per-env applied plan ids — channel-scoping the watermark must
+        // NOT leak into `applied_plan_ids`, or a broadcast plan requiring a
+        // per-env prerequisite would be falsely rejected.
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        apply_plan_on_channel(&root, "per-env-prereq", "prod", 7);
+
+        let bcast = verified(plan_with("bcast", BROADCAST_ENV_ID, 1, vec![]));
+        let mut seen_ids: Vec<String> = Vec::new();
+        root.begin_checked(&bcast, b"p", b"s", |facts| {
+            seen_ids = facts.applied_plan_ids.clone();
+            // The per-channel watermark stays empty for `_` (the per-env plan is
+            // on a different channel), so the broadcast plan is not a downgrade.
+            assert_eq!(facts.latest_applied_sequence, None);
+            crate::plan::ensure_not_downgrade(&bcast.plan, facts.latest_applied_sequence)
+        })
+        .unwrap();
+        assert!(
+            seen_ids.iter().any(|p| p == "per-env-prereq"),
+            "broadcast admission must see the per-env applied id for `requires` (got {seen_ids:?})"
+        );
     }
 
     #[test]
