@@ -151,6 +151,7 @@ pub fn is_valid_transition(from: UpdateStage, to: UpdateStage) -> bool {
 // ---------------------------------------------------------------------------
 
 /// The per-plan `state.json` marker.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StageState {
     /// Always [`STAGE_STATE_SCHEMA_V1`].
@@ -165,6 +166,12 @@ pub struct StageState {
     pub stage: UpdateStage,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// The plan's target channel — its [`UpdatePlan::env_id`] (`_` for broadcast,
+    /// the env name for per-env). Added in 1.1.2 for per-channel downgrade
+    /// scoping; legacy markers deserialize as `None` and are backfilled at read
+    /// time from the sibling `plan.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
 }
 
 /// One append-only audit line recording a mechanical stage transition.
@@ -439,8 +446,10 @@ impl UpdatesRoot {
 
         // Snapshot the applied set under the held lock, then let the caller gate
         // on it. `admission_facts_locked` uses the lock-free `scan_plans`, so it
-        // does not re-enter `acquire_lock` (fs4 flock is not reentrant).
-        let facts = self.admission_facts_locked()?;
+        // does not re-enter `acquire_lock` (fs4 flock is not reentrant). The
+        // channel is the plan's target env (`_` for broadcast, the env name for
+        // per-env), so the downgrade guard is scoped to plans from the same source.
+        let facts = self.admission_facts_locked(&plan.env_id)?;
         admission(&facts).map_err(BeginCheckedError::Rejected)?;
 
         self.write_new_plan(verified, plan_bytes, envelope_bytes, &plan_dir)
@@ -483,7 +492,7 @@ impl UpdatesRoot {
         // The target must exist and still be `Staged` — re-read under the lock so
         // a transition that landed since the caller's `load` cannot be applied
         // over.
-        let state = read_state(&plan_dir)?.ok_or_else(|| StagingError::PlanNotFound {
+        let mut state = read_state(&plan_dir)?.ok_or_else(|| StagingError::PlanNotFound {
             plan_id: plan_id.to_string(),
             env_id: self.env_id.clone(),
         })?;
@@ -496,9 +505,14 @@ impl UpdatesRoot {
             .into());
         }
 
+        // Resolve the target plan's channel (backfill legacy `None` markers from
+        // plan.json) so the downgrade guard is scoped correctly.
+        Self::backfill_channel(&mut state, &plan_dir, &self.env_id);
+        let channel = state.channel.as_deref().unwrap_or(&self.env_id);
+
         // Single-flight: at most one plan may be `Applying` per env. The target
         // is `Staged` (checked above), so any `Applying` plan is another one.
-        let (applying, facts) = self.apply_admission_locked()?;
+        let (applying, facts) = self.apply_admission_locked(channel)?;
         if let Some(applying) = applying {
             return Err(BeginApplyError::AlreadyApplying {
                 env_id: self.env_id.clone(),
@@ -549,11 +563,11 @@ impl UpdatesRoot {
     /// to avoid re-entering the non-reentrant flock. Uses the **strict** scan:
     /// a corrupt or directory-mismatched `Applied` marker fails admission closed
     /// rather than lowering the visible `latest_applied_sequence`.
-    fn admission_facts_locked(&self) -> Result<AdmissionFacts, StagingError> {
+    fn admission_facts_locked(&self, channel: &str) -> Result<AdmissionFacts, StagingError> {
         let applied: Vec<StageState> = self
             .scan_plans(true)?
             .into_iter()
-            .filter(|s| s.stage == UpdateStage::Applied)
+            .filter(|s| s.stage == UpdateStage::Applied && s.channel.as_deref() == Some(channel))
             .collect();
         Ok(AdmissionFacts {
             latest_applied_sequence: applied.iter().map(|s| s.sequence).max(),
@@ -579,15 +593,20 @@ impl UpdatesRoot {
     /// visible here; only external deletion of a live marker (outside the staging
     /// trust model, which defends path/segment integrity, not arbitrary FS
     /// writes) could hide one.
-    fn apply_admission_locked(&self) -> Result<(Option<String>, AdmissionFacts), StagingError> {
+    fn apply_admission_locked(
+        &self,
+        channel: &str,
+    ) -> Result<(Option<String>, AdmissionFacts), StagingError> {
         let states = self.scan_plans(true)?;
+        // Single-flight is env-wide, not channel-scoped: at most one plan may
+        // be `Applying` per env regardless of channel.
         let applying = states
             .iter()
             .find(|s| s.stage == UpdateStage::Applying)
             .map(|s| s.plan_id.clone());
         let applied: Vec<&StageState> = states
             .iter()
-            .filter(|s| s.stage == UpdateStage::Applied)
+            .filter(|s| s.stage == UpdateStage::Applied && s.channel.as_deref() == Some(channel))
             .collect();
         let facts = AdmissionFacts {
             latest_applied_sequence: applied.iter().map(|s| s.sequence).max(),
@@ -633,6 +652,7 @@ impl UpdatesRoot {
             stage: UpdateStage::Downloading,
             created_at: now,
             updated_at: now,
+            channel: Some(plan.env_id.clone()),
         };
         write_state(plan_dir, &state)?;
         append_audit(
@@ -715,6 +735,24 @@ impl UpdatesRoot {
         self.scan_plans(false)
     }
 
+    /// Resolve the effective channel for a stage state, backfilling legacy
+    /// `None` markers from the sibling `plan.json` (its `env_id` is the plan's
+    /// target channel). Falls back to the local env id when `plan.json` is
+    /// absent or unparseable — broadcast plans are recent, so a pruned or
+    /// ancient marker without a `plan.json` is per-env by construction.
+    fn backfill_channel(state: &mut StageState, plan_dir: &Path, local_env_id: &str) {
+        if state.channel.is_some() {
+            return;
+        }
+        let plan_path = plan_dir.join(PLAN_FILE);
+        let channel = fs::read(&plan_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|v| v.get("env_id")?.as_str().map(str::to_owned))
+            .unwrap_or_else(|| local_env_id.to_string());
+        state.channel = Some(channel);
+    }
+
     /// Enumerate plan markers under the env dir. Deliberately **does not**
     /// acquire the env `.lock`, so it can be called by callers that already hold
     /// it (`apply_retention`, `begin_checked` via `admission_facts_locked`) —
@@ -760,7 +798,10 @@ impl UpdatesRoot {
             // (best-effort), but a strict admission scan fails closed rather
             // than silently omit a possibly-`Applied` plan.
             match read_state(&entry.path()) {
-                Ok(Some(state)) if state.plan_id == name => out.push(state),
+                Ok(Some(mut state)) if state.plan_id == name => {
+                    Self::backfill_channel(&mut state, &entry.path(), &self.env_id);
+                    out.push(state);
+                }
                 Ok(Some(state)) if strict => {
                     return Err(StagingError::CorruptAdmissionState {
                         plan_id: name,
@@ -2266,6 +2307,7 @@ mod tests {
             stage: UpdateStage::Failed,
             created_at: now,
             updated_at: now,
+            channel: None,
         };
         write_state(&decoy, &forged).unwrap();
 
@@ -2478,6 +2520,162 @@ mod tests {
             .collect();
         assert!(survivors.contains(&"active".to_string()));
         assert_eq!(survivors.len(), 2);
+    }
+
+    // --- Channel-scoped downgrade guard tests ---
+
+    /// Drive a plan to Applied on a specific channel (env_id controls channel).
+    fn apply_plan_on_channel(root: &UpdatesRoot, plan_id: &str, env_id: &str, sequence: u64) {
+        let plan = plan_with(plan_id, env_id, sequence, vec![]);
+        let plan_bytes = serde_json::to_vec(&plan).unwrap();
+        let staged = root.begin(&verified(plan), &plan_bytes, b"s").unwrap();
+        staged.transition(UpdateStage::Inbox).unwrap();
+        staged.transition(UpdateStage::Staged).unwrap();
+        staged.transition(UpdateStage::Applying).unwrap();
+        staged.transition(UpdateStage::Applied).unwrap();
+    }
+
+    #[test]
+    fn channel_migration_broadcast_to_per_env() {
+        // Apply a high-sequence broadcast plan, then begin a LOW sequence
+        // per-env plan. Different channels => no downgrade rejection.
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        apply_plan_on_channel(&root, "bcast-high", BROADCAST_ENV_ID, 100);
+
+        let low_env = verified(plan_with("env-low", "prod", 5, vec![]));
+        let result = root.begin_checked(&low_env, b"p", b"s", |facts| {
+            crate::plan::ensure_not_downgrade(&low_env.plan, facts.latest_applied_sequence)
+        });
+        assert!(
+            result.is_ok(),
+            "per-env plan at seq 5 must be admitted after broadcast at seq 100 (different channel)"
+        );
+    }
+
+    #[test]
+    fn channel_migration_per_env_to_broadcast() {
+        // Apply a high-sequence per-env plan, then begin a LOW sequence
+        // broadcast plan. Different channels => no downgrade rejection.
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        apply_plan_on_channel(&root, "env-high", "prod", 100);
+
+        let low_bcast = verified(plan_with("bcast-low", BROADCAST_ENV_ID, 3, vec![]));
+        let result = root.begin_checked(&low_bcast, b"p", b"s", |facts| {
+            crate::plan::ensure_not_downgrade(&low_bcast.plan, facts.latest_applied_sequence)
+        });
+        assert!(
+            result.is_ok(),
+            "broadcast plan at seq 3 must be admitted after per-env at seq 100 (different channel)"
+        );
+    }
+
+    #[test]
+    fn same_channel_downgrade_still_rejected() {
+        // A lower sequence on the SAME channel is still rejected.
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        apply_plan_on_channel(&root, "first", "prod", 10);
+
+        let stale = verified(plan_with("stale", "prod", 5, vec![]));
+        let err = root
+            .begin_checked(&stale, b"p", b"s", |facts| {
+                crate::plan::ensure_not_downgrade(&stale.plan, facts.latest_applied_sequence)
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BeginCheckedError::Rejected(crate::plan::PlanError::Downgrade { plan: 5, last: 10 })
+        ));
+    }
+
+    #[test]
+    fn legacy_none_marker_backfilled_from_plan_json() {
+        // A `channel: None` marker with a sibling plan.json whose `env_id` is
+        // `_` (broadcast) must be treated as channel `_`, not the local env.
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+
+        // Create a plan directory with a broadcast plan.json and a legacy
+        // state.json (no channel field).
+        let plan = plan_with("legacy-bcast", BROADCAST_ENV_ID, 50, vec![]);
+        let plan_bytes = serde_json::to_vec(&plan).unwrap();
+        let plan_dir = root.env_dir().join("legacy-bcast");
+        fs::create_dir_all(plan_dir.join(ARTIFACTS_DIR)).unwrap();
+        atomic_write_bytes(&plan_dir.join(PLAN_FILE), &plan_bytes).unwrap();
+        atomic_write_bytes(&plan_dir.join(SIG_FILE), b"sig").unwrap();
+
+        let now = Utc::now();
+        let legacy = StageState {
+            schema: STAGE_STATE_SCHEMA_V1.to_string(),
+            plan_id: "legacy-bcast".to_string(),
+            env_id: "prod".to_string(),
+            sequence: 50,
+            plan_sha256: "0".repeat(64),
+            stage: UpdateStage::Applied,
+            created_at: now,
+            updated_at: now,
+            channel: None, // legacy — no channel recorded
+        };
+        write_state(&plan_dir, &legacy).unwrap();
+
+        // Listing must backfill channel from plan.json.
+        let states = root.list().unwrap();
+        let found = states.iter().find(|s| s.plan_id == "legacy-bcast").unwrap();
+        assert_eq!(
+            found.channel.as_deref(),
+            Some(BROADCAST_ENV_ID),
+            "legacy marker must be backfilled to broadcast channel from plan.json"
+        );
+
+        // A per-env plan at a lower sequence must be admitted (different channel).
+        let low_env = verified(plan_with("env-low", "prod", 5, vec![]));
+        let result = root.begin_checked(&low_env, b"p", b"s", |facts| {
+            crate::plan::ensure_not_downgrade(&low_env.plan, facts.latest_applied_sequence)
+        });
+        assert!(
+            result.is_ok(),
+            "per-env plan at seq 5 admitted after legacy broadcast marker at seq 50"
+        );
+    }
+
+    #[test]
+    fn serde_missing_channel_deserializes_as_none() {
+        let now = Utc::now();
+        // JSON without a "channel" key — the pre-1.1.2 on-disk format.
+        let json = serde_json::json!({
+            "schema": STAGE_STATE_SCHEMA_V1,
+            "plan_id": "plan-old",
+            "env_id": "prod",
+            "sequence": 1,
+            "plan_sha256": "0".repeat(64),
+            "stage": "applied",
+            "created_at": now,
+            "updated_at": now,
+        });
+        let state: StageState = serde_json::from_value(json).unwrap();
+        assert_eq!(state.channel, None);
+    }
+
+    #[test]
+    fn serde_roundtrip_with_channel() {
+        let now = Utc::now();
+        let state = StageState {
+            schema: STAGE_STATE_SCHEMA_V1.to_string(),
+            plan_id: "plan-ch".to_string(),
+            env_id: "prod".to_string(),
+            sequence: 7,
+            plan_sha256: "a".repeat(64),
+            stage: UpdateStage::Applied,
+            created_at: now,
+            updated_at: now,
+            channel: Some("_".to_string()),
+        };
+        let bytes = serde_json::to_vec_pretty(&state).unwrap();
+        let back: StageState = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.channel, Some("_".to_string()));
+        assert_eq!(state, back);
     }
 
     #[test]
