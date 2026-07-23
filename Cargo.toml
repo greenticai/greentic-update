@@ -78,7 +78,7 @@ self-replace = { version = "1", optional = true }
 [dev-dependencies]
 # Deterministic Ed25519 test keypairs (PKCS#8 / SPKI PEM) for plan signing tests.
 # `serde_json` is a normal dependency, so tests use it without re-declaring here.
-ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
+ed25519-dalek = { version = "3", features = ["pkcs8", "pem"] }
 # `rcgen` is also an optional runtime dep (behind `enroll`); the dev-dep keeps it
 # available to plan/tls tests that run without that feature. `x509-parser` is
 # dev-only: it enables `CertificateSigningRequestParams::from_pem` so a test can
