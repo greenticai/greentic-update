@@ -65,27 +65,21 @@ pub const UPDATE_PLAN_PREDICATE_TYPE_V1: &str = "greentic.update-plan-predicate.
 /// narrower question, enforced by the applier (`greentic-deployer`), which owns
 /// the env-manifest type this crate deliberately keeps opaque.
 ///
-/// **One channel per environment, for the whole life of the environment.**
-/// [`UpdatePlan::sequence`] is monotonic *per channel*, and the broadcast
-/// channel counts independently of any per-env one. The downgrade guard
-/// ([`ensure_not_downgrade`]) compares an incoming plan against the highest
-/// sequence applied to the environment *from any source* — `StageState` records
-/// no channel — so two counters in one staging tree are indistinguishable.
+/// **Sequence monotonicity is per channel.** [`UpdatePlan::sequence`] is
+/// monotonic *per channel*, and the broadcast channel counts independently of
+/// any per-env one. Since 1.1.2 `StageState` records the plan's target channel
+/// and the downgrade guard ([`ensure_not_downgrade`]) scopes the applied
+/// sequence by channel, so an environment can safely migrate between channels
+/// without wedging its downgrade watermark. Legacy markers (pre-1.1.2, no
+/// channel field) are backfilled at read time from the sibling `plan.json`.
 ///
-/// This bites on **sequential migration**, not just simultaneous consumption:
-/// repointing an environment's `plan_endpoint` from a per-env channel at
-/// sequence `N` to the broadcast channel at `M < N` leaves the old channel's
-/// applied history in place, and every broadcast plan is refused as a downgrade
-/// until the broadcast counter passes `N`. The reverse is worse — a fleet-wide
-/// broadcast counter outruns any single environment's, so a broadcast→per-env
-/// switch can wedge effectively forever. The failure is silent and per-poll:
-/// the plan fetches and verifies, then loses at admission.
-///
-/// So an environment must stay on the channel it starts on. Nothing enforces
-/// that. Giving `StageState` a channel field and computing downgrade facts per
-/// channel — or defining one shared sequence space plus a tested migration
-/// procedure — is the real fix, and is deliberately out of scope here: it
-/// changes the on-disk staging schema, which this addressing change does not.
+/// **Bootstrap-deadlock policy.** A minimum broadcast-capable version floor
+/// must never be delivered solely over the `_` broadcast channel it enables —
+/// version floors ride the installer (the toolchain manifest) or a per-env
+/// channel the old code already parses. `_` becomes a delivery mechanism only
+/// once the fleet is known to be at or above the floor. Violating this
+/// creates a bootstrap deadlock: environments below the floor cannot parse
+/// the broadcast plan that would upgrade them past it.
 pub const BROADCAST_ENV_ID: &str = "_";
 
 /// Whether a plan addressed to `plan_env` should be accepted by the environment
