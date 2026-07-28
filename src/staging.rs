@@ -920,7 +920,13 @@ impl UpdatesRoot {
             return Ok(false);
         };
         let blob = self.env_dir.join(CAS_DIR).join(&dir_name);
-        Ok(blob.exists())
+        // Use symlink_metadata (lstat) instead of Path::exists so symlinks
+        // planted at the CAS path are not followed. Confirms the entry is a
+        // regular file, consistent with the read_regular_file_in guard that
+        // cas_get applies.
+        Ok(fs::symlink_metadata(&blob)
+            .map(|m| m.is_file())
+            .unwrap_or(false))
     }
 
     /// Enumerate every digest in the CAS, returned as `sha256:<hex>` strings.
@@ -996,8 +1002,17 @@ impl UpdatesRoot {
         let sig_path = self.env_dir.join(IMPORT_RECEIPT_SIG_FILE);
         assert_no_symlink_ancestors(&self.env_dir, &receipt_path)?;
         assert_no_symlink_ancestors(&self.env_dir, &sig_path)?;
-        atomic_write_bytes(&receipt_path, receipt_bytes)?;
+        // Write sig FIRST, receipt second. `read_import_receipt` gates on the
+        // receipt file: if a crash leaves sig-on-disk but no receipt, the reader
+        // returns `Ok(None)` cleanly (orphaned sig is invisible and overwritten
+        // on next write). The reverse order would leave receipt-without-sig,
+        // which makes the reader hit a hard I/O error instead of None.
+        //
+        // The overwrite case (crash between the two renames when both files
+        // already exist) can still produce a mismatched pair; this is caught by
+        // the mandatory `verify_import_receipt` in the envelope module.
         atomic_write_bytes(&sig_path, sig_bytes)?;
+        atomic_write_bytes(&receipt_path, receipt_bytes)?;
         Ok(())
     }
 
@@ -3122,6 +3137,52 @@ mod tests {
     // ------------------------------------------------------------------
     // apply_retention must NOT touch cas/ or the receipt
     // ------------------------------------------------------------------
+
+    /// Regression: if only the sig file exists on disk (simulating a crash
+    /// after sig-write but before receipt-write), `read_import_receipt` must
+    /// return `Ok(None)` — not a hard I/O error.
+    #[test]
+    fn receipt_orphaned_sig_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        // Manually place only the sig sidecar (no receipt file).
+        let sig_path = root.env_dir().join(IMPORT_RECEIPT_SIG_FILE);
+        fs::create_dir_all(root.env_dir()).unwrap();
+        fs::write(&sig_path, b"orphaned-sig").unwrap();
+
+        // Must be None, not Err.
+        assert!(
+            root.read_import_receipt().unwrap().is_none(),
+            "orphaned sig without receipt must read as None"
+        );
+    }
+
+    /// Regression: `cas_contains` must not follow symlinks. A symlink at
+    /// the CAS path pointing to an existing file must return false — the
+    /// blob is not a regular file in the CAS store.
+    #[cfg(unix)]
+    #[test]
+    fn cas_contains_rejects_symlink() {
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("decoy");
+        fs::write(&target, b"out-of-tree content").unwrap();
+
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        let payload = b"real-blob";
+        let digest = digest_of(payload);
+
+        // Write the real blob, then replace it with a symlink.
+        let path = root.cas_put(&digest, payload).unwrap();
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        // cas_contains must return false (not follow the symlink).
+        assert!(
+            !root.cas_contains(&digest).unwrap(),
+            "cas_contains must not follow symlinks"
+        );
+    }
 
     #[test]
     fn apply_retention_leaves_cas_and_receipt_intact() {
