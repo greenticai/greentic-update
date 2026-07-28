@@ -2641,6 +2641,21 @@ mod tests {
     }
 
     #[test]
+    fn verify_binary_on_disk_happy_path() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        let payload = b"binary-executable";
+        let bin = binary("gtc", payload, "x86_64-unknown-linux-gnu");
+        let v = verified(plan_with_binaries("plan-1", "prod", 1, vec![bin.clone()]));
+        let staged = root.begin(&v, b"p", b"s").unwrap();
+        staged.put_binary_blob(&bin, payload).unwrap();
+
+        // Verify the untampered blob round-trips correctly.
+        let bytes = staged.verify_binary_on_disk(&bin).unwrap();
+        assert_eq!(bytes, payload);
+    }
+
+    #[test]
     fn put_binary_blob_rejects_wrong_stage() {
         let tmp = TempDir::new().unwrap();
         let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();

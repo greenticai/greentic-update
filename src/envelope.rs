@@ -625,6 +625,7 @@ pub fn scan_envelope_to_dir<R: Read>(
         seen_paths.insert(path_str);
         let data = read_entry_bytes(&mut entry, size)?;
         decompressed_total += data.len() as u64;
+        check_total_and_ratio(decompressed_total, &compressed_count, limits)?;
         data
     };
 
@@ -643,8 +644,18 @@ pub fn scan_envelope_to_dir<R: Read>(
         }
         seen_paths.insert(path_str);
         let size = entry.header().size().map_err(EnvelopeError::ArchiveIo)?;
+        // The DSSE signature envelope is typically smaller than the document it
+        // signs.  Bound it identically to the manifest to prevent a
+        // pre-authentication OOM from an attacker-crafted header size.
+        if size > limits.max_manifest_bytes {
+            return Err(EnvelopeError::OversizedManifest {
+                size,
+                limit: limits.max_manifest_bytes,
+            });
+        }
         let data = read_entry_bytes(&mut entry, size)?;
         decompressed_total += data.len() as u64;
+        check_total_and_ratio(decompressed_total, &compressed_count, limits)?;
         data
     };
 
@@ -709,6 +720,7 @@ pub fn scan_envelope_to_dir<R: Read>(
         let data = read_entry_bytes(&mut entry, size)?;
         verify_manifest_entry(&path_str, &data, &expected)?;
         decompressed_total += data.len() as u64;
+        check_total_and_ratio(decompressed_total, &compressed_count, limits)?;
         std::fs::write(&plan_path, &data).map_err(|source| EnvelopeError::Io {
             path: plan_path.clone(),
             source,
@@ -742,6 +754,7 @@ pub fn scan_envelope_to_dir<R: Read>(
         let data = read_entry_bytes(&mut entry, size)?;
         verify_manifest_entry(&path_str, &data, &expected)?;
         decompressed_total += data.len() as u64;
+        check_total_and_ratio(decompressed_total, &compressed_count, limits)?;
         std::fs::write(&sig_path, &data).map_err(|source| EnvelopeError::Io {
             path: sig_path.clone(),
             source,
@@ -860,12 +873,18 @@ pub fn scan_envelope_to_dir<R: Read>(
             blob_paths.insert(digest, dest);
         } else if path_str == TRUST_ROTATION_PATH {
             seen_trust_rotation = true;
-            let me = expected.get(&path_str);
+            // Trust-rotation entries MUST be listed in the signed manifest
+            // with digest + size, just like blobs.  An un-manifested entry
+            // is unauthenticated content injected after signing.
+            let me = expected
+                .get(&path_str)
+                .ok_or_else(|| EnvelopeError::ExtraEntry {
+                    path: path_str.clone(),
+                })?;
             let data = read_entry_bytes(&mut entry, header_size)?;
             decompressed_total += data.len() as u64;
-            if let Some(me) = me {
-                verify_entry_digest_size(&path_str, &data, me)?;
-            }
+            check_total_and_ratio(decompressed_total, &compressed_count, limits)?;
+            verify_entry_digest_size(&path_str, &data, me)?;
             let dest = quarantine_dir.join(TRUST_ROTATION_PATH);
             std::fs::write(&dest, &data).map_err(|source| EnvelopeError::Io {
                 path: dest.clone(),
@@ -880,12 +899,15 @@ pub fn scan_envelope_to_dir<R: Read>(
                     found: path_str,
                 });
             }
-            let me = expected.get(&path_str);
+            let me = expected
+                .get(&path_str)
+                .ok_or_else(|| EnvelopeError::ExtraEntry {
+                    path: path_str.clone(),
+                })?;
             let data = read_entry_bytes(&mut entry, header_size)?;
             decompressed_total += data.len() as u64;
-            if let Some(me) = me {
-                verify_entry_digest_size(&path_str, &data, me)?;
-            }
+            check_total_and_ratio(decompressed_total, &compressed_count, limits)?;
+            verify_entry_digest_size(&path_str, &data, me)?;
             let dest = quarantine_dir.join(TRUST_ROTATION_SIG_PATH);
             std::fs::write(&dest, &data).map_err(|source| EnvelopeError::Io {
                 path: dest.clone(),
@@ -1148,7 +1170,7 @@ fn check_entry_limits<R: Read>(
     entry: &tar::Entry<'_, R>,
     limits: &ScanLimits,
     entry_count: &mut usize,
-    _decompressed_total: u64,
+    decompressed_total: u64,
 ) -> Result<(), EnvelopeError> {
     if *entry_count > limits.max_entry_count {
         return Err(EnvelopeError::TooManyEntries {
@@ -1164,13 +1186,50 @@ fn check_entry_limits<R: Read>(
             limit: limits.max_entry_bytes,
         });
     }
+    if decompressed_total > limits.max_total_bytes {
+        return Err(EnvelopeError::OversizedTotal {
+            total: decompressed_total,
+            limit: limits.max_total_bytes,
+        });
+    }
+    Ok(())
+}
+
+/// Check global decompressed-total and compression-ratio limits after reading
+/// an in-memory entry via [`read_entry_bytes`]. This mirrors the per-chunk
+/// checks inside [`stream_entry_to_file`] (blobs), closing the gap for entries
+/// processed entirely in memory (plan, plan sig, trust-rotation, manifest).
+fn check_total_and_ratio(
+    decompressed_total: u64,
+    compressed_count: &Rc<Cell<u64>>,
+    limits: &ScanLimits,
+) -> Result<(), EnvelopeError> {
+    if decompressed_total > limits.max_total_bytes {
+        return Err(EnvelopeError::OversizedTotal {
+            total: decompressed_total,
+            limit: limits.max_total_bytes,
+        });
+    }
+    let compressed = compressed_count.get();
+    if compressed > 0 {
+        let ratio = decompressed_total as f64 / compressed as f64;
+        if ratio > limits.max_compression_ratio {
+            return Err(EnvelopeError::DecompressionBomb {
+                ratio,
+                limit: limits.max_compression_ratio,
+            });
+        }
+    }
     Ok(())
 }
 
 /// Read an entry's full content into memory (for small entries: manifest, plan,
-/// signatures).
+/// signatures). Pre-allocation is capped at 128 KiB (matching the tar crate's
+/// own `read_all` strategy) so an attacker-crafted header size does not cause a
+/// one-shot multi-GiB allocation.
 fn read_entry_bytes<R: Read>(entry: &mut R, size: u64) -> Result<Vec<u8>, EnvelopeError> {
-    let mut buf = Vec::with_capacity(size as usize);
+    let cap = std::cmp::min(size, 128 * 1024) as usize;
+    let mut buf = Vec::with_capacity(cap);
     entry
         .read_to_end(&mut buf)
         .map_err(EnvelopeError::ArchiveIo)?;
@@ -2400,6 +2459,154 @@ mod tests {
         assert!(
             matches!(err, EnvelopeError::Sign(_)),
             "expected Sign, got: {err}"
+        );
+    }
+
+    // -- Regression: manifest.json.sig size bound (pre-auth OOM DoS) ------
+
+    #[test]
+    fn scan_rejects_oversized_manifest_sig() {
+        let fix = TestFixture::new();
+        // Build an archive where the manifest sig entry's declared size
+        // exceeds max_manifest_bytes. The manifest itself (~810 B) passes
+        // the limit, but the oversized sig (2 KiB of zeros) trips the
+        // same bound before any signature is verified (pre-auth).
+        let big_sig = vec![0u8; 2048];
+        let archive = build_hostile_archive(vec![
+            (
+                regular_header(fix.manifest_bytes.len() as u64),
+                MANIFEST_PATH,
+                &fix.manifest_bytes,
+            ),
+            (
+                regular_header(big_sig.len() as u64),
+                MANIFEST_SIG_PATH,
+                &big_sig,
+            ),
+        ]);
+        let quarantine = TempDir::new().unwrap();
+        // Limit must be above the real manifest size but below the big sig.
+        let limits = ScanLimits {
+            max_manifest_bytes: 1024,
+            ..ScanLimits::default()
+        };
+        let err = scan_envelope_to_dir(
+            std::io::Cursor::new(&archive),
+            &fix.trust_root,
+            &limits,
+            quarantine.path(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EnvelopeError::OversizedManifest {
+                    size: 2048,
+                    limit: 1024
+                }
+            ),
+            "expected OversizedManifest for sig entry, got: {err}"
+        );
+    }
+
+    // -- Regression: trust-rotation injected without manifest listing ------
+
+    #[test]
+    fn scan_rejects_unmanifested_trust_rotation() {
+        let fix = TestFixture::new();
+        // Inject a trust-rotation.json entry that is NOT listed in the signed
+        // manifest. The scanner must reject it as ExtraEntry.
+        let trust_data = b"injected-trust-rotation";
+        let trust_sig_data = b"injected-trust-sig";
+        let blob_path = fix.blob_archive_path();
+        let archive = build_hostile_archive(vec![
+            (
+                regular_header(fix.manifest_bytes.len() as u64),
+                MANIFEST_PATH,
+                &fix.manifest_bytes,
+            ),
+            (
+                regular_header(fix.manifest_sig_bytes.len() as u64),
+                MANIFEST_SIG_PATH,
+                &fix.manifest_sig_bytes,
+            ),
+            (
+                regular_header(fix.plan_bytes.len() as u64),
+                PLAN_PATH,
+                &fix.plan_bytes,
+            ),
+            (
+                regular_header(fix.plan_sig_bytes.len() as u64),
+                PLAN_SIG_PATH,
+                &fix.plan_sig_bytes,
+            ),
+            (
+                regular_header(fix.blob_content.len() as u64),
+                &blob_path,
+                &fix.blob_content,
+            ),
+            (
+                regular_header(trust_data.len() as u64),
+                TRUST_ROTATION_PATH,
+                trust_data,
+            ),
+            (
+                regular_header(trust_sig_data.len() as u64),
+                TRUST_ROTATION_SIG_PATH,
+                trust_sig_data,
+            ),
+        ]);
+        let quarantine = TempDir::new().unwrap();
+        let err = scan_envelope_to_dir(
+            std::io::Cursor::new(&archive),
+            &fix.trust_root,
+            &ScanLimits::default(),
+            quarantine.path(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, EnvelopeError::ExtraEntry { ref path } if path == TRUST_ROTATION_PATH),
+            "expected ExtraEntry for trust-rotation.json, got: {err}"
+        );
+    }
+
+    // -- Regression: per-entry blob size limit (max_entry_bytes) -----------
+
+    #[test]
+    fn scan_rejects_oversized_blob_entry() {
+        // Use a blob larger than the plan/sig entries so we can set
+        // max_entry_bytes between them, hitting the blob-loop guard at
+        // line 789 specifically (not check_entry_limits for plan entries).
+        let large_blob = vec![0x42u8; 8192];
+        let (priv_pem, tk) = test_key(42);
+        let trust = TrustRoot::new(vec![tk.clone()]);
+        let plan = test_plan(vec![test_artifact("big-pack", &large_blob)], vec![]);
+        let blob_digest = format!("sha256:{}", plan::sha256_hex(&large_blob));
+        let archive = build_valid_envelope(
+            &plan,
+            &priv_pem,
+            &tk.key_id,
+            &trust,
+            &[(&blob_digest, &large_blob, "application/octet-stream", None)],
+        );
+        let quarantine = TempDir::new().unwrap();
+        // max_entry_bytes is above the plan/sig entries (~1-2 KiB each)
+        // but below the 8 KiB blob, so the blob-loop check fires.
+        let limits = ScanLimits {
+            max_entry_bytes: 4096,
+            max_total_bytes: u64::MAX,
+            ..ScanLimits::default()
+        };
+        let err = scan_envelope_to_dir(
+            std::io::Cursor::new(&archive),
+            &trust,
+            &limits,
+            quarantine.path(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, EnvelopeError::OversizedEntry { .. }),
+            "expected OversizedEntry, got: {err}"
         );
     }
 }
