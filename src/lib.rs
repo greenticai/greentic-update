@@ -25,6 +25,7 @@ pub mod binswap;
 pub mod catalogue;
 #[cfg(feature = "enroll")]
 pub mod enroll;
+#[cfg(feature = "envelope")]
 pub mod envelope;
 pub mod plan;
 pub mod staging;

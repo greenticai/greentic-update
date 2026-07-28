@@ -27,6 +27,10 @@ enroll = ["dep:reqwest", "dep:rcgen"]
 # Windows running-exe replacement via `self-replace`. OFF by default
 # to keep the lean build free of archive / compression deps.
 binswap = ["dep:tar", "dep:flate2", "dep:zip", "dep:self-replace"]
+# Airgap update envelope: zstd-compressed tar archive with DSSE-signed manifest.
+# Builder and scanner for `.gtupdate` files. Does NOT require `binswap` —
+# archive extraction/creation uses tar directly; zstd handles compression.
+envelope = ["dep:tar", "dep:zstd"]
 # SSE (Server-Sent Events) transport for plan-update push notifications.
 # Reuses the existing `reqwest` dep with the `blocking` feature added.
 stream = ["dep:reqwest", "reqwest/blocking"]
@@ -69,6 +73,7 @@ tar = { version = "0.4", optional = true }
 flate2 = { version = "1", optional = true }
 zip = { version = "2", optional = true, default-features = false, features = ["deflate"] }
 self-replace = { version = "1", optional = true }
+zstd = { version = "0.13", optional = true }
 
 [dev-dependencies]
 # Deterministic Ed25519 test keypairs (PKCS#8 / SPKI PEM) for plan signing tests.
