@@ -386,6 +386,7 @@ pub struct EnvelopeBuilder<W: Write> {
 /// [`EnvelopeBuilder::finish`].
 struct BlobRecord {
     digest: String,
+    dir_name: String,
     temp_path: PathBuf,
     size: u64,
     media_type: String,
@@ -471,6 +472,7 @@ impl<W: Write> EnvelopeBuilder<W> {
         })?;
         self.blobs.push(BlobRecord {
             digest: digest.to_string(),
+            dir_name,
             temp_path,
             size: bytes.len() as u64,
             media_type: media_type.to_string(),
@@ -507,9 +509,8 @@ impl<W: Write> EnvelopeBuilder<W> {
             target: None,
         });
         for blob in &self.blobs {
-            let (dir_name, _) = staging::digest_dir_name(&blob.digest)?;
             entries.push(ManifestEntry {
-                path: format!("{BLOBS_PREFIX}{dir_name}"),
+                path: format!("{BLOBS_PREFIX}{}", blob.dir_name),
                 digest: blob.digest.clone(),
                 size: blob.size,
                 media_type: blob.media_type.clone(),
@@ -544,8 +545,7 @@ impl<W: Write> EnvelopeBuilder<W> {
         append_bytes_entry(&mut tar, PLAN_SIG_PATH, &plan_sig_bytes)?;
 
         for blob in &self.blobs {
-            let (dir_name, _) = staging::digest_dir_name(&blob.digest)?;
-            let archive_path = format!("{BLOBS_PREFIX}{dir_name}");
+            let archive_path = format!("{BLOBS_PREFIX}{}", blob.dir_name);
             let file =
                 std::fs::File::open(&blob.temp_path).map_err(|source| EnvelopeError::Io {
                     path: blob.temp_path.clone(),
@@ -715,13 +715,7 @@ pub fn scan_envelope_to_dir<R: Read>(
                 found: path_str,
             });
         }
-        check_entry_limits(
-            &path_str,
-            &entry,
-            limits,
-            &mut entry_count,
-            decompressed_total,
-        )?;
+        check_entry_limits(&path_str, &entry, limits, entry_count, decompressed_total)?;
         seen_paths.insert(path_str.clone());
         let size = entry.header().size().map_err(EnvelopeError::ArchiveIo)?;
         reject_header_size_mismatch(&path_str, size, &expected)?;
@@ -750,13 +744,7 @@ pub fn scan_envelope_to_dir<R: Read>(
                 found: path_str,
             });
         }
-        check_entry_limits(
-            &path_str,
-            &entry,
-            limits,
-            &mut entry_count,
-            decompressed_total,
-        )?;
+        check_entry_limits(&path_str, &entry, limits, entry_count, decompressed_total)?;
         seen_paths.insert(path_str.clone());
         let size = entry.header().size().map_err(EnvelopeError::ArchiveIo)?;
         reject_header_size_mismatch(&path_str, size, &expected)?;
@@ -785,6 +773,11 @@ pub fn scan_envelope_to_dir<R: Read>(
 
     // ---- Remaining entries: blobs and optional trust-rotation ------------
     let blobs_dir = quarantine_dir.join("blobs");
+    std::fs::create_dir_all(&blobs_dir).map_err(|source| EnvelopeError::Io {
+        path: blobs_dir.clone(),
+        source,
+    })?;
+    staging::assert_no_symlink_ancestors(quarantine_dir, &blobs_dir)?;
     let mut blob_paths: HashMap<String, PathBuf> = HashMap::new();
     let mut trust_rotation_path: Option<PathBuf> = None;
     let mut trust_rotation_sig_path: Option<PathBuf> = None;
@@ -830,22 +823,19 @@ pub fn scan_envelope_to_dir<R: Read>(
             let digest = format!("sha256:{}", &blob_name["sha256-".len()..]);
 
             // The blob must be in the manifest.
-            if !expected.contains_key(&path_str) {
-                return Err(EnvelopeError::ExtraEntry { path: path_str });
-            }
+            let me = expected
+                .get(&path_str)
+                .ok_or_else(|| EnvelopeError::ExtraEntry {
+                    path: path_str.clone(),
+                })?;
             // The blob must be referenced by the plan.
             if !plan_digests.contains(&digest) {
                 return Err(EnvelopeError::UnreferencedBlob { digest });
             }
 
             // Stream to quarantine, compute SHA-256 during the copy.
-            std::fs::create_dir_all(&blobs_dir).map_err(|source| EnvelopeError::Io {
-                path: blobs_dir.clone(),
-                source,
-            })?;
-            staging::assert_no_symlink_ancestors(quarantine_dir, &blobs_dir)?;
             let dest = blobs_dir.join(blob_name);
-            let actual_hex = stream_entry_to_file(
+            let (actual_hex, bytes_written) = stream_entry_to_file(
                 &mut entry,
                 &dest,
                 header_size,
@@ -855,7 +845,6 @@ pub fn scan_envelope_to_dir<R: Read>(
             )?;
 
             // Verify content digest.
-            let me = expected.get(&path_str).unwrap();
             let (_, expected_hex) = staging::digest_dir_name(&me.digest)?;
             if actual_hex != expected_hex {
                 return Err(EnvelopeError::TamperedBlob {
@@ -865,17 +854,11 @@ pub fn scan_envelope_to_dir<R: Read>(
                 });
             }
             // Verify size.
-            let actual_size = std::fs::metadata(&dest)
-                .map_err(|source| EnvelopeError::Io {
-                    path: dest.clone(),
-                    source,
-                })?
-                .len();
-            if actual_size != me.size {
+            if bytes_written != me.size {
                 return Err(EnvelopeError::SizeMismatch {
                     path: path_str,
                     declared: me.size,
-                    actual: actual_size,
+                    actual: bytes_written,
                 });
             }
 
@@ -1203,12 +1186,12 @@ fn check_entry_limits<R: Read>(
     path: &str,
     entry: &tar::Entry<'_, R>,
     limits: &ScanLimits,
-    entry_count: &mut usize,
+    entry_count: usize,
     decompressed_total: u64,
 ) -> Result<(), EnvelopeError> {
-    if *entry_count > limits.max_entry_count {
+    if entry_count > limits.max_entry_count {
         return Err(EnvelopeError::TooManyEntries {
-            count: *entry_count,
+            count: entry_count,
             limit: limits.max_entry_count,
         });
     }
@@ -1332,7 +1315,7 @@ fn verify_entry_digest_size(
 
 /// Stream a tar entry to a file inside the quarantine directory, computing
 /// SHA-256 during the copy and enforcing resource limits during decompression.
-/// Returns the lowercase-hex content digest.
+/// Returns `(lowercase_hex_digest, bytes_written)`.
 fn stream_entry_to_file<R: Read>(
     entry: &mut R,
     dest: &Path,
@@ -1340,7 +1323,7 @@ fn stream_entry_to_file<R: Read>(
     limits: &ScanLimits,
     decompressed_total: &mut u64,
     compressed_count: &Rc<Cell<u64>>,
-) -> Result<String, EnvelopeError> {
+) -> Result<(String, u64), EnvelopeError> {
     let mut hasher = Sha256::new();
     let mut file = std::fs::File::create(dest).map_err(|source| EnvelopeError::Io {
         path: dest.to_path_buf(),
@@ -1389,7 +1372,8 @@ fn stream_entry_to_file<R: Read>(
         path: dest.to_path_buf(),
         source,
     })?;
-    Ok(hex::encode(hasher.finalize()))
+    let written = entry_size - remaining;
+    Ok((hex::encode(hasher.finalize()), written))
 }
 
 // ---------------------------------------------------------------------------
