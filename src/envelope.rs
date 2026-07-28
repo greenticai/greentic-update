@@ -595,7 +595,14 @@ pub fn scan_envelope_to_dir<R: Read>(
         count: compressed_count.clone(),
     };
     let decoder = zstd::Decoder::new(counting).map_err(EnvelopeError::ArchiveIo)?;
-    let mut archive = tar::Archive::new(decoder);
+    // Wrap the decompressed stream in a LimitingReader so that every byte the
+    // tar layer consumes — including invisible GNU long-name/link and PAX
+    // extension entries — is bounded by max_total_bytes.
+    let limiting = LimitingReader {
+        inner: decoder,
+        remaining: limits.max_total_bytes,
+    };
+    let mut archive = tar::Archive::new(limiting);
     let mut entries_iter = archive.entries().map_err(EnvelopeError::ArchiveIo)?;
 
     let mut entry_count: usize = 0;
@@ -717,6 +724,7 @@ pub fn scan_envelope_to_dir<R: Read>(
         )?;
         seen_paths.insert(path_str.clone());
         let size = entry.header().size().map_err(EnvelopeError::ArchiveIo)?;
+        reject_header_size_mismatch(&path_str, size, &expected)?;
         let data = read_entry_bytes(&mut entry, size)?;
         verify_manifest_entry(&path_str, &data, &expected)?;
         decompressed_total += data.len() as u64;
@@ -751,6 +759,7 @@ pub fn scan_envelope_to_dir<R: Read>(
         )?;
         seen_paths.insert(path_str.clone());
         let size = entry.header().size().map_err(EnvelopeError::ArchiveIo)?;
+        reject_header_size_mismatch(&path_str, size, &expected)?;
         let data = read_entry_bytes(&mut entry, size)?;
         verify_manifest_entry(&path_str, &data, &expected)?;
         decompressed_total += data.len() as u64;
@@ -1062,6 +1071,31 @@ impl<R: Read> Read for CountingReader<R> {
     }
 }
 
+/// A `Read` adapter that enforces a hard cap on total bytes read.
+///
+/// Wraps the **decompressed** side of the zstd decoder so that every byte
+/// consumed by the tar layer — including transparent GNU long-name/link and PAX
+/// extension entries that `Archive::entries()` processes without yielding —
+/// counts toward the limit. Without this, a hostile extension record placed
+/// before `manifest.json` could allocate unbounded memory before any scanner
+/// limit fires.
+struct LimitingReader<R> {
+    inner: R,
+    remaining: u64,
+}
+
+impl<R: Read> Read for LimitingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.remaining == 0 {
+            return Err(io::Error::other("decompressed byte limit exceeded"));
+        }
+        let max = std::cmp::min(buf.len() as u64, self.remaining) as usize;
+        let n = self.inner.read(&mut buf[..max])?;
+        self.remaining -= n as u64;
+        Ok(n)
+    }
+}
+
 /// Get the next entry from the iterator or return [`EnvelopeError::UnexpectedEof`].
 fn next_required<'a, R: Read>(
     entries: &mut tar::Entries<'a, R>,
@@ -1234,6 +1268,27 @@ fn read_entry_bytes<R: Read>(entry: &mut R, size: u64) -> Result<Vec<u8>, Envelo
         .read_to_end(&mut buf)
         .map_err(EnvelopeError::ArchiveIo)?;
     Ok(buf)
+}
+
+/// Reject a tar entry whose header size does not match the manifest-declared
+/// size, before reading its body. This prevents an attacker from repacking a
+/// legitimately signed envelope with inflated tar headers to force multi-GiB
+/// memory allocation for entries that the manifest declares as small.
+fn reject_header_size_mismatch(
+    path: &str,
+    header_size: u64,
+    expected: &HashMap<String, &ManifestEntry>,
+) -> Result<(), EnvelopeError> {
+    if let Some(me) = expected.get(path)
+        && header_size != me.size
+    {
+        return Err(EnvelopeError::SizeMismatch {
+            path: path.to_string(),
+            declared: me.size,
+            actual: header_size,
+        });
+    }
+    Ok(())
 }
 
 /// Verify an archive entry's content against the manifest (digest + size).
@@ -2394,17 +2449,17 @@ mod tests {
             quarantine.path(),
         )
         .unwrap_err();
-        // The scanner reads manifest entries (which count toward total
-        // internally only for blobs via stream_entry_to_file, but manifest
-        // bytes also accumulate); the first entry that pushes past the limit
-        // triggers the error. The exact variant depends on which entry
-        // pushes past; accept either OversizedTotal or OversizedEntry.
+        // With the LimitingReader wrapping the decompressed stream, exceeding
+        // max_total_bytes can surface as ArchiveIo (from the LimitingReader)
+        // before the scanner's own check_total_and_ratio fires.
         assert!(
             matches!(
                 err,
-                EnvelopeError::OversizedTotal { .. } | EnvelopeError::OversizedEntry { .. }
+                EnvelopeError::OversizedTotal { .. }
+                    | EnvelopeError::OversizedEntry { .. }
+                    | EnvelopeError::ArchiveIo(_)
             ),
-            "expected OversizedTotal or OversizedEntry, got: {err}"
+            "expected OversizedTotal, OversizedEntry, or ArchiveIo, got: {err}"
         );
     }
 
@@ -2607,6 +2662,71 @@ mod tests {
         assert!(
             matches!(err, EnvelopeError::OversizedEntry { .. }),
             "expected OversizedEntry, got: {err}"
+        );
+    }
+
+    // -- Regression: GNU long-name extension bypasses scanner limits ------
+
+    #[test]
+    fn scan_rejects_oversized_gnu_longname_extension() {
+        // A hostile archive places a GNU LongName extension entry (type 'L')
+        // before manifest.json. The tar crate's entries() iterator
+        // transparently processes extension entries without yielding them,
+        // reading their full body into memory to determine the next entry's
+        // path. Without the LimitingReader, this bypasses ALL scanner limits
+        // because the scanner never sees the extension entry.
+        //
+        // The LimitingReader wraps the decompressed stream and enforces
+        // max_total_bytes on every byte the tar layer reads, including
+        // invisible extension bodies.
+        let longname_body = vec![b'A'; 128 * 1024]; // 128 KiB of path data
+
+        // Build the raw tar: GNULongName header + body, then manifest header.
+        let mut tar_bytes = Vec::new();
+
+        // Extension header (type 'L' = GNULongName).
+        let mut ext_header = tar::Header::new_gnu();
+        ext_header.set_entry_type(tar::EntryType::GNULongName);
+        ext_header.set_size(longname_body.len() as u64);
+        ext_header.set_mode(0);
+        ext_header.set_mtime(0);
+        set_header_path_raw(&mut ext_header, "././@LongLink");
+        tar_bytes.extend_from_slice(ext_header.as_bytes());
+        tar_bytes.extend_from_slice(&tar_content_padded(&longname_body));
+
+        // The actual file header that the extension applies to.
+        let file_content = b"not-a-real-manifest";
+        let mut file_header = regular_header(file_content.len() as u64);
+        set_header_path_raw(&mut file_header, "manifest.json");
+        tar_bytes.extend_from_slice(file_header.as_bytes());
+        tar_bytes.extend_from_slice(&tar_content_padded(file_content));
+
+        // End-of-archive trailer.
+        tar_bytes.extend_from_slice(&[0u8; 1024]);
+
+        let compressed = zstd::encode_all(std::io::Cursor::new(&tar_bytes), 3).unwrap();
+
+        let fix = TestFixture::new();
+        let quarantine = TempDir::new().unwrap();
+        let limits = ScanLimits {
+            max_total_bytes: 64 * 1024, // 64 KiB — less than the 128 KiB extension body
+            ..ScanLimits::default()
+        };
+        let err = scan_envelope_to_dir(
+            std::io::Cursor::new(&compressed),
+            &fix.trust_root,
+            &limits,
+            quarantine.path(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, EnvelopeError::ArchiveIo(_)),
+            "expected ArchiveIo from LimitingReader, got: {err}"
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("decompressed byte limit exceeded"),
+            "error should mention limit exceeded, got: {msg}"
         );
     }
 }
