@@ -54,7 +54,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::plan::{PlanArtifact, VerifiedUpdatePlan};
+use crate::plan::{BinaryArtifact, PlanArtifact, VerifiedUpdatePlan};
 
 /// Environment variable overriding the updates root directory.
 pub const UPDATES_DIR_VAR: &str = "GREENTIC_UPDATES_DIR";
@@ -71,6 +71,7 @@ const ARTIFACTS_DIR: &str = "artifacts";
 const AUDIT_DIR: &str = "audit";
 const AUDIT_FILE: &str = "events.jsonl";
 const LOCK_FILE: &str = ".lock";
+const BINARIES_DIR: &str = "binaries";
 const BLOB_FILE: &str = "blob";
 
 // ---------------------------------------------------------------------------
@@ -984,6 +985,91 @@ impl StagedPlan {
         Ok(blob)
     }
 
+    // ------------------------------------------------------------------
+    // Binary blob trio — mirrors the artifact trio for self-update binaries
+    // ------------------------------------------------------------------
+
+    /// The content-addressed blob path for a binary artifact
+    /// (`binaries/sha256-<hex>/blob`). Validates the digest format first, so a
+    /// malformed `binary.digest` is rejected before any filesystem access.
+    pub fn binary_blob_path(&self, binary: &BinaryArtifact) -> Result<PathBuf, StagingError> {
+        let (dir_name, _) = digest_dir_name(&binary.digest)?;
+        Ok(self
+            .plan_dir
+            .join(BINARIES_DIR)
+            .join(dir_name)
+            .join(BLOB_FILE))
+    }
+
+    /// Verify `bytes` against `binary.digest`, then write them to
+    /// `binaries/sha256-<hex>/blob`. Content-addressed and idempotent (a
+    /// re-download of the same digest overwrites identical bytes). Rejects a
+    /// malformed digest or a hash mismatch **before** writing. Takes the per-env
+    /// lock and requires the plan to still be `Downloading` — a binary must not
+    /// land in a promoted or terminal plan.
+    pub fn put_binary_blob(
+        &self,
+        binary: &BinaryArtifact,
+        bytes: &[u8],
+    ) -> Result<PathBuf, StagingError> {
+        let (dir_name, expected_hex) = digest_dir_name(&binary.digest)?;
+        let actual_hex = crate::plan::sha256_hex(bytes);
+        if actual_hex != expected_hex {
+            return Err(StagingError::DigestMismatch {
+                name: binary.name.clone(),
+                expected: binary.digest.clone(),
+                actual: format!("sha256:{actual_hex}"),
+            });
+        }
+        // Serialize with transitions/retention and refuse to write into a plan
+        // that has already left `Downloading`.
+        let _lock = acquire_lock(&self.env_dir)?;
+        let stage = read_state(&self.plan_dir)?
+            .ok_or_else(|| self.plan_not_found())?
+            .stage;
+        if stage != UpdateStage::Downloading {
+            return Err(StagingError::ArtifactNotDownloading {
+                plan_id: self.plan.plan_id.clone(),
+                stage,
+            });
+        }
+        let blob = self
+            .plan_dir
+            .join(BINARIES_DIR)
+            .join(&dir_name)
+            .join(BLOB_FILE);
+        assert_no_symlink_ancestors(&self.env_dir, &blob)?;
+        atomic_write_bytes(&blob, bytes)?;
+        Ok(blob)
+    }
+
+    /// Re-read a staged binary's blob and re-verify its SHA-256 against
+    /// `binary.digest`, returning the bytes on match. [`Self::put_binary_blob`]
+    /// hashes on ingest, but the bytes on disk are untrusted at apply-time —
+    /// this closes the read-side integrity check and fails closed with
+    /// [`StagingError::DigestMismatch`].
+    pub fn verify_binary_on_disk(&self, binary: &BinaryArtifact) -> Result<Vec<u8>, StagingError> {
+        let (dir_name, expected_hex) = digest_dir_name(&binary.digest)?;
+        let blob = self
+            .plan_dir
+            .join(BINARIES_DIR)
+            .join(dir_name)
+            .join(BLOB_FILE);
+        // The staging tree is untrusted at apply time: refuse a symlinked or
+        // non-regular blob before reading, so the integrity check can't be
+        // tricked into following a symlink out of the tree or blocking on a FIFO.
+        let bytes = read_regular_file_in(&self.env_dir, &blob)?;
+        let actual_hex = crate::plan::sha256_hex(&bytes);
+        if actual_hex != expected_hex {
+            return Err(StagingError::DigestMismatch {
+                name: binary.name.clone(),
+                expected: binary.digest.clone(),
+                actual: format!("sha256:{actual_hex}"),
+            });
+        }
+        Ok(bytes)
+    }
+
     /// Move the plan to `to`, gated by [`is_valid_transition`], rewriting
     /// `state.json` atomically and appending an audit line. Serialized by the
     /// per-env `.lock`. Returns the new state.
@@ -1139,7 +1225,7 @@ fn validate_plan_id(plan_id: &str) -> Result<(), StagingError> {
 /// TOCTOU window is bounded to the lock scope. Mirrors the deployer's
 /// `path_safety::assert_no_symlink_ancestors`. No-op when `target` is not under
 /// `root`.
-fn assert_no_symlink_ancestors(root: &Path, target: &Path) -> Result<(), StagingError> {
+pub(crate) fn assert_no_symlink_ancestors(root: &Path, target: &Path) -> Result<(), StagingError> {
     let Ok(suffix) = target.strip_prefix(root) else {
         return Ok(());
     };
@@ -1169,7 +1255,7 @@ fn assert_no_symlink_ancestors(root: &Path, target: &Path) -> Result<(), Staging
 /// guard — reject a symlink at any path component (an escape) and a non-regular
 /// final file (a FIFO/device/socket/directory would block or return non-file
 /// bytes) *before* `fs::read` follows anything dangerous.
-fn read_regular_file_in(root: &Path, path: &Path) -> Result<Vec<u8>, StagingError> {
+pub(crate) fn read_regular_file_in(root: &Path, path: &Path) -> Result<Vec<u8>, StagingError> {
     assert_no_symlink_ancestors(root, path)?;
     let meta = fs::symlink_metadata(path).map_err(|source| StagingError::Io {
         path: path.to_path_buf(),
@@ -1189,7 +1275,7 @@ fn read_regular_file_in(root: &Path, path: &Path) -> Result<Vec<u8>, StagingErro
 /// Validate a `sha256:<64 hex>` digest, returning its directory name
 /// (`sha256-<lowercase hex>`) and the validated lowercase hex — so callers that
 /// need both parse the digest once.
-fn digest_dir_name(digest: &str) -> Result<(String, String), StagingError> {
+pub(crate) fn digest_dir_name(digest: &str) -> Result<(String, String), StagingError> {
     let hex = digest
         .strip_prefix("sha256:")
         .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
@@ -2468,5 +2554,106 @@ mod tests {
                 Err(StagingError::MalformedDigest { .. })
             ));
         }
+    }
+
+    fn binary(name: &str, bytes: &[u8], target: &str) -> BinaryArtifact {
+        BinaryArtifact {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            target: target.to_string(),
+            digest: digest_of(bytes),
+            source: None,
+        }
+    }
+
+    fn plan_with_binaries(
+        plan_id: &str,
+        env_id: &str,
+        sequence: u64,
+        binaries: Vec<BinaryArtifact>,
+    ) -> UpdatePlan {
+        UpdatePlan {
+            schema: crate::plan::UPDATE_PLAN_SCHEMA_V1.to_string(),
+            plan_id: plan_id.to_string(),
+            env_id: env_id.to_string(),
+            sequence,
+            created_at: Utc::now(),
+            nonce: "test-nonce".to_string(),
+            target: serde_json::json!({}),
+            artifacts: vec![],
+            binaries,
+            compat: CompatRequirements::default(),
+            rollback: RollbackPolicy {
+                policy: RollbackKind::Auto,
+                health_timeout_s: 60,
+                on_fail: OnFail::Restore,
+            },
+        }
+    }
+
+    #[test]
+    fn put_binary_blob_happy_path() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        let payload = b"binary-executable";
+        let bin = binary("gtc", payload, "x86_64-unknown-linux-gnu");
+        let v = verified(plan_with_binaries("plan-1", "prod", 1, vec![bin.clone()]));
+        let staged = root.begin(&v, b"p", b"s").unwrap();
+
+        let blob = staged.put_binary_blob(&bin, payload).unwrap();
+        assert_eq!(fs::read(&blob).unwrap(), payload);
+        assert!(blob.ends_with(BLOB_FILE));
+        // The blob lives under binaries/, not artifacts/.
+        assert!(blob.to_string_lossy().contains("/binaries/"));
+    }
+
+    #[test]
+    fn put_binary_blob_rejects_digest_mismatch() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        let payload = b"binary-executable";
+        let bin = binary("gtc", payload, "x86_64-unknown-linux-gnu");
+        let v = verified(plan_with_binaries("plan-1", "prod", 1, vec![bin.clone()]));
+        let staged = root.begin(&v, b"p", b"s").unwrap();
+
+        assert!(matches!(
+            staged.put_binary_blob(&bin, b"tampered-binary"),
+            Err(StagingError::DigestMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn verify_binary_on_disk_rejects_tampered_blob() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        let payload = b"binary-executable";
+        let bin = binary("gtc", payload, "x86_64-unknown-linux-gnu");
+        let v = verified(plan_with_binaries("plan-1", "prod", 1, vec![bin.clone()]));
+        let staged = root.begin(&v, b"p", b"s").unwrap();
+        let blob = staged.put_binary_blob(&bin, payload).unwrap();
+
+        // Tamper the blob on disk after writing.
+        fs::write(&blob, b"corrupted").unwrap();
+        assert!(matches!(
+            staged.verify_binary_on_disk(&bin),
+            Err(StagingError::DigestMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn put_binary_blob_rejects_wrong_stage() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        let payload = b"binary-executable";
+        let bin = binary("gtc", payload, "x86_64-unknown-linux-gnu");
+        let v = verified(plan_with_binaries("plan-1", "prod", 1, vec![bin.clone()]));
+        let staged = root.begin(&v, b"p", b"s").unwrap();
+
+        // Advance past Downloading — put_binary_blob should reject.
+        staged.transition(UpdateStage::Inbox).unwrap();
+        assert!(matches!(
+            staged.put_binary_blob(&bin, payload),
+            Err(StagingError::ArtifactNotDownloading { .. })
+        ));
     }
 }
