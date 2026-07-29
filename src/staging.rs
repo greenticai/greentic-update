@@ -730,6 +730,19 @@ impl UpdatesRoot {
         self.scan_plans(false)
     }
 
+    /// Strict variant of [`list`](Self::list): a present-but-unreadable,
+    /// corrupt, or directory-mismatched `state.json` is a hard
+    /// [`StagingError::CorruptAdmissionState`] instead of being silently
+    /// skipped. For callers whose safety decisions must never run against a
+    /// snapshot that dropped a possibly-`Applied` plan — e.g. a CAS garbage
+    /// collector computing the referenced-blob set, where a silently skipped
+    /// plan would make its blobs look orphaned and eligible for deletion.
+    /// An *absent* `state.json` (legitimately incomplete plan) is still
+    /// skipped, exactly as in admission scans.
+    pub fn list_strict(&self) -> Result<Vec<StageState>, StagingError> {
+        self.scan_plans(true)
+    }
+
     /// Enumerate plan markers under the env dir. Deliberately **does not**
     /// acquire the env `.lock`, so it can be called by callers that already hold
     /// it (`apply_retention`, `begin_checked` via `admission_facts_locked`) —
@@ -2062,6 +2075,27 @@ mod tests {
         ));
         // The best-effort `list()` still tolerates the corrupt marker.
         assert!(root.list().is_ok());
+    }
+
+    #[test]
+    fn list_strict_fails_closed_on_corrupt_marker() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        apply_plan(&root, "old", 5);
+
+        // Clean tree: strict and forgiving enumeration agree.
+        assert_eq!(root.list_strict().unwrap().len(), 1);
+
+        // Corrupt the marker: `list()` silently skips it, so a GC computing
+        // its referenced-blob set from `list()` would see the plan's blobs as
+        // orphaned. `list_strict()` must fail closed instead.
+        let marker = tmp.path().join("prod").join("old").join(STATE_FILE);
+        fs::write(&marker, b"{ not valid json").unwrap();
+        assert!(root.list().unwrap().is_empty());
+        assert!(matches!(
+            root.list_strict().unwrap_err(),
+            StagingError::CorruptAdmissionState { .. }
+        ));
     }
 
     #[test]
