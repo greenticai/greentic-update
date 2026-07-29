@@ -3,6 +3,14 @@
 > **Status:** Approved (rev 2, 2026-07-28).  Design-gate round 1 complete; all
 > findings folded in (see [Design-gate round 1 summary](#design-gate-round-1-summary)).
 >
+> **Implementation:** Phases A and B shipped on the dev lane (2026-07-29):
+> envelope library + `op updates export` (A); import CAS + signed receipts +
+> `op updates import`/`cas-gc`, in-band binary consumption in
+> `greentic-start`, receipt-based delta export, `export --binary-blob`
+> staging, the Tier 1 E2E, and the operator quickstart
+> (`greentic-deployer/docs/airgap-quickstart.md`) (B).  Phases C and D are
+> not started.
+>
 > **Scope:** Design only.  Per-phase implementation plans are separate artifacts.
 
 ---
