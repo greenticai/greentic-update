@@ -54,7 +54,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::plan::{PlanArtifact, VerifiedUpdatePlan, plan_targets_env};
+use crate::plan::{BinaryArtifact, PlanArtifact, VerifiedUpdatePlan, plan_targets_env};
 
 /// Environment variable overriding the updates root directory.
 pub const UPDATES_DIR_VAR: &str = "GREENTIC_UPDATES_DIR";
@@ -71,7 +71,11 @@ const ARTIFACTS_DIR: &str = "artifacts";
 const AUDIT_DIR: &str = "audit";
 const AUDIT_FILE: &str = "events.jsonl";
 const LOCK_FILE: &str = ".lock";
+const BINARIES_DIR: &str = "binaries";
 const BLOB_FILE: &str = "blob";
+const CAS_DIR: &str = "cas";
+const IMPORT_RECEIPT_FILE: &str = "import-receipt.json";
+const IMPORT_RECEIPT_SIG_FILE: &str = "import-receipt.json.sig";
 
 // ---------------------------------------------------------------------------
 // Stage state machine
@@ -276,6 +280,18 @@ pub enum StagingError {
     /// the downgrade/compat snapshot.
     #[error("cannot trust state for plan `{plan_id}` during admission: {reason}")]
     CorruptAdmissionState { plan_id: String, reason: String },
+    /// A [`preflight_digests`](UpdatesRoot::preflight_digests) check found one
+    /// or more plan-referenced digests that are not present in either the
+    /// envelope's carried blobs or the durable import CAS. The error lists
+    /// **every** missing digest (fail closed — never first-only) so a single
+    /// preflight invocation surfaces the full remediation scope.
+    #[error("preflight: {missing_count} digest(s) missing from envelope + CAS")]
+    PreflightMissing {
+        /// The digests (`sha256:<hex>`) that are absent.
+        missing: Vec<String>,
+        /// Convenience: `missing.len()`.
+        missing_count: usize,
+    },
     /// The current thread already holds this env's `.lock`. The flock is not
     /// reentrant, so re-acquiring would deadlock — this is returned instead of
     /// hanging. It signals a staging method was called from inside a
@@ -750,6 +766,19 @@ impl UpdatesRoot {
         self.scan_plans(false)
     }
 
+    /// Strict variant of [`list`](Self::list): a present-but-unreadable,
+    /// corrupt, or directory-mismatched `state.json` is a hard
+    /// [`StagingError::CorruptAdmissionState`] instead of being silently
+    /// skipped. For callers whose safety decisions must never run against a
+    /// snapshot that dropped a possibly-`Applied` plan — e.g. a CAS garbage
+    /// collector computing the referenced-blob set, where a silently skipped
+    /// plan would make its blobs look orphaned and eligible for deletion.
+    /// An *absent* `state.json` (legitimately incomplete plan) is still
+    /// skipped, exactly as in admission scans.
+    pub fn list_strict(&self) -> Result<Vec<StageState>, StagingError> {
+        self.scan_plans(true)
+    }
+
     /// Resolve the effective channel for a stage state, backfilling legacy
     /// `None` markers from the sibling `plan.json` (its `env_id` is the plan's
     /// target channel). Falls back to the local env id when `plan.json` is
@@ -901,6 +930,238 @@ impl UpdatesRoot {
         }
         Ok(RetentionReport { scanned, evicted })
     }
+
+    // ------------------------------------------------------------------
+    // Per-env import CAS
+    // ------------------------------------------------------------------
+    //
+    // A durable, content-addressed store at `<env_dir>/cas/sha256-<hex>`
+    // that survives `apply_retention` (which evicts per-plan dirs only).
+    //
+    // Why per-env (not shared across envs):
+    //   - Matches the existing per-env lock/retention model.
+    //   - No cross-env refcounting complexity.
+    //   - Delta exports dedupe at the export boundary, not the store.
+    //
+    // The CAS dir is a sibling of the per-plan dirs, INSIDE the env
+    // scope `UpdatesRoot` already manages. `apply_retention` enumerates
+    // plan dirs via `scan_plans` → `validate_plan_id`, which rejects
+    // `cas` as a reserved name, so retention never touches this dir.
+
+    /// Write `bytes` into the CAS at `cas/sha256-<hex>`, verifying that the
+    /// SHA-256 of `bytes` matches the declared `digest` before committing.
+    /// Content-addressed and idempotent: if the blob already exists with
+    /// identical content, this is a no-op. Rejects a malformed digest or a
+    /// hash mismatch **before** writing.
+    ///
+    /// Takes the per-env flock so that CAS mutations serialize with plan
+    /// transitions and retention.
+    pub fn cas_put(&self, digest: &str, bytes: &[u8]) -> Result<PathBuf, StagingError> {
+        let (dir_name, expected_hex) = digest_dir_name(digest)?;
+        let actual_hex = crate::plan::sha256_hex(bytes);
+        if actual_hex != expected_hex {
+            return Err(StagingError::DigestMismatch {
+                name: format!("cas:{digest}"),
+                expected: digest.to_string(),
+                actual: format!("sha256:{actual_hex}"),
+            });
+        }
+        let _lock = acquire_lock(&self.env_dir)?;
+        let blob = self.env_dir.join(CAS_DIR).join(&dir_name);
+        assert_no_symlink_ancestors(&self.env_dir, &blob)?;
+        atomic_write_bytes(&blob, bytes)?;
+        Ok(blob)
+    }
+
+    /// Read the CAS blob for `digest`, re-verifying its SHA-256 against the
+    /// declared digest on every read (defense-in-depth: on-disk bytes are
+    /// untrusted). The blob must be a regular file with no symlink ancestors.
+    pub fn cas_get(&self, digest: &str) -> Result<Vec<u8>, StagingError> {
+        let (dir_name, expected_hex) = digest_dir_name(digest)?;
+        let blob = self.env_dir.join(CAS_DIR).join(&dir_name);
+        let bytes = read_regular_file_in(&self.env_dir, &blob)?;
+        let actual_hex = crate::plan::sha256_hex(&bytes);
+        if actual_hex != expected_hex {
+            return Err(StagingError::DigestMismatch {
+                name: format!("cas:{digest}"),
+                expected: digest.to_string(),
+                actual: format!("sha256:{actual_hex}"),
+            });
+        }
+        Ok(bytes)
+    }
+
+    /// Whether the CAS holds a blob for `digest`. Returns `false` for a
+    /// malformed digest rather than erroring, matching the "is it present?"
+    /// intent.
+    pub fn cas_contains(&self, digest: &str) -> Result<bool, StagingError> {
+        let Ok((dir_name, _)) = digest_dir_name(digest) else {
+            return Ok(false);
+        };
+        let blob = self.env_dir.join(CAS_DIR).join(&dir_name);
+        // Use symlink_metadata (lstat) instead of Path::exists so symlinks
+        // planted at the CAS path are not followed. Confirms the entry is a
+        // regular file, consistent with the read_regular_file_in guard that
+        // cas_get applies.
+        Ok(fs::symlink_metadata(&blob)
+            .map(|m| m.is_file())
+            .unwrap_or(false))
+    }
+
+    /// Enumerate every digest in the CAS, returned as `sha256:<hex>` strings.
+    /// Order is filesystem-dependent.
+    pub fn cas_list(&self) -> Result<Vec<String>, StagingError> {
+        let cas_dir = self.env_dir.join(CAS_DIR);
+        let entries = match fs::read_dir(&cas_dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => {
+                return Err(StagingError::Io {
+                    path: cas_dir,
+                    source,
+                });
+            }
+        };
+        let mut digests = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| StagingError::Io {
+                path: cas_dir.clone(),
+                source,
+            })?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            // Accept only well-formed `sha256-<64 hex>` entries; skip
+            // unexpected files/dirs (crash artifacts, editor temp files, etc.)
+            // rather than error — best-effort enumeration, same as `list()`.
+            if let Some(hex) = name.strip_prefix("sha256-")
+                && hex.len() == 64
+                && hex.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                digests.push(format!("sha256:{}", hex.to_ascii_lowercase()));
+            }
+        }
+        Ok(digests)
+    }
+
+    /// Remove a single CAS blob. No-op if the blob does not exist (idempotent
+    /// delete). Takes the per-env flock.
+    pub fn cas_remove(&self, digest: &str) -> Result<(), StagingError> {
+        let (dir_name, _) = digest_dir_name(digest)?;
+        let _lock = acquire_lock(&self.env_dir)?;
+        let blob = self.env_dir.join(CAS_DIR).join(&dir_name);
+        match fs::remove_file(&blob) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(StagingError::Io { path: blob, source }),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Import receipt
+    // ------------------------------------------------------------------
+    //
+    // Opaque (receipt_bytes, sig_bytes) stored at stable per-env locations:
+    //   <env_dir>/import-receipt.json
+    //   <env_dir>/import-receipt.json.sig
+    //
+    // Atomic overwrite semantics — each write replaces the previous receipt.
+    // Building and verifying the receipt content is the envelope module's
+    // responsibility; this layer only stores/retrieves opaque bytes.
+
+    /// Persist an import receipt (opaque bytes + DSSE signature sidecar).
+    /// Atomically overwrites any existing receipt. Takes the per-env flock.
+    pub fn write_import_receipt(
+        &self,
+        receipt_bytes: &[u8],
+        sig_bytes: &[u8],
+    ) -> Result<(), StagingError> {
+        let _lock = acquire_lock(&self.env_dir)?;
+        let receipt_path = self.env_dir.join(IMPORT_RECEIPT_FILE);
+        let sig_path = self.env_dir.join(IMPORT_RECEIPT_SIG_FILE);
+        assert_no_symlink_ancestors(&self.env_dir, &receipt_path)?;
+        assert_no_symlink_ancestors(&self.env_dir, &sig_path)?;
+        // Write sig FIRST, receipt second. `read_import_receipt` gates on the
+        // receipt file: if a crash leaves sig-on-disk but no receipt, the reader
+        // returns `Ok(None)` cleanly (orphaned sig is invisible and overwritten
+        // on next write). The reverse order would leave receipt-without-sig,
+        // which makes the reader hit a hard I/O error instead of None.
+        //
+        // The overwrite case (crash between the two renames when both files
+        // already exist) can still produce a mismatched pair; this is caught by
+        // the mandatory `verify_import_receipt` in the envelope module.
+        atomic_write_bytes(&sig_path, sig_bytes)?;
+        atomic_write_bytes(&receipt_path, receipt_bytes)?;
+        Ok(())
+    }
+
+    /// Read the import receipt, or `None` if no receipt has been written yet.
+    /// Returns `(receipt_bytes, sig_bytes)`. Both paths must be regular files
+    /// with no symlink ancestors.
+    pub fn read_import_receipt(&self) -> Result<Option<ImportReceiptPair>, StagingError> {
+        let receipt_path = self.env_dir.join(IMPORT_RECEIPT_FILE);
+        let sig_path = self.env_dir.join(IMPORT_RECEIPT_SIG_FILE);
+        let receipt_bytes = match read_regular_file_in(&self.env_dir, &receipt_path) {
+            Ok(bytes) => bytes,
+            Err(StagingError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        let sig_bytes = read_regular_file_in(&self.env_dir, &sig_path)?;
+        Ok(Some((receipt_bytes, sig_bytes)))
+    }
+
+    // ------------------------------------------------------------------
+    // Preflight digest resolution
+    // ------------------------------------------------------------------
+
+    /// Check that **every** digest referenced by the plan's artifacts and
+    /// binaries is satisfied — either carried in the envelope (by digest) or
+    /// already present in the durable import CAS.
+    ///
+    /// On success: every digest is resolvable and the import can proceed.
+    ///
+    /// On failure: returns [`StagingError::PreflightMissing`] listing **all**
+    /// missing digests (fail closed, never first-only), so a single preflight
+    /// invocation surfaces the full remediation scope — the operator knows
+    /// exactly which blobs the next delta export must carry.
+    ///
+    /// `envelope_digests` is the set of `sha256:<hex>` digests the incoming
+    /// envelope carries (the caller extracts this from the scanned manifest).
+    pub fn preflight_digests(
+        &self,
+        artifacts: &[PlanArtifact],
+        binaries: &[BinaryArtifact],
+        envelope_digests: &HashSet<String>,
+    ) -> Result<(), StagingError> {
+        let mut missing = Vec::new();
+        for art in artifacts {
+            // Validate the digest format first so malformed digests surface as
+            // preflight failures, not silent skips.
+            digest_dir_name(&art.digest)?;
+            if !envelope_digests.contains(&art.digest) && !self.cas_contains(&art.digest)? {
+                missing.push(art.digest.clone());
+            }
+        }
+        for bin in binaries {
+            digest_dir_name(&bin.digest)?;
+            if !envelope_digests.contains(&bin.digest) && !self.cas_contains(&bin.digest)? {
+                missing.push(bin.digest.clone());
+            }
+        }
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            let missing_count = missing.len();
+            Err(StagingError::PreflightMissing {
+                missing,
+                missing_count,
+            })
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1050,6 +1311,91 @@ impl StagedPlan {
         Ok(blob)
     }
 
+    // ------------------------------------------------------------------
+    // Binary blob trio — mirrors the artifact trio for self-update binaries
+    // ------------------------------------------------------------------
+
+    /// The content-addressed blob path for a binary artifact
+    /// (`binaries/sha256-<hex>/blob`). Validates the digest format first, so a
+    /// malformed `binary.digest` is rejected before any filesystem access.
+    pub fn binary_blob_path(&self, binary: &BinaryArtifact) -> Result<PathBuf, StagingError> {
+        let (dir_name, _) = digest_dir_name(&binary.digest)?;
+        Ok(self
+            .plan_dir
+            .join(BINARIES_DIR)
+            .join(dir_name)
+            .join(BLOB_FILE))
+    }
+
+    /// Verify `bytes` against `binary.digest`, then write them to
+    /// `binaries/sha256-<hex>/blob`. Content-addressed and idempotent (a
+    /// re-download of the same digest overwrites identical bytes). Rejects a
+    /// malformed digest or a hash mismatch **before** writing. Takes the per-env
+    /// lock and requires the plan to still be `Downloading` — a binary must not
+    /// land in a promoted or terminal plan.
+    pub fn put_binary_blob(
+        &self,
+        binary: &BinaryArtifact,
+        bytes: &[u8],
+    ) -> Result<PathBuf, StagingError> {
+        let (dir_name, expected_hex) = digest_dir_name(&binary.digest)?;
+        let actual_hex = crate::plan::sha256_hex(bytes);
+        if actual_hex != expected_hex {
+            return Err(StagingError::DigestMismatch {
+                name: binary.name.clone(),
+                expected: binary.digest.clone(),
+                actual: format!("sha256:{actual_hex}"),
+            });
+        }
+        // Serialize with transitions/retention and refuse to write into a plan
+        // that has already left `Downloading`.
+        let _lock = acquire_lock(&self.env_dir)?;
+        let stage = read_state(&self.plan_dir)?
+            .ok_or_else(|| self.plan_not_found())?
+            .stage;
+        if stage != UpdateStage::Downloading {
+            return Err(StagingError::ArtifactNotDownloading {
+                plan_id: self.plan.plan_id.clone(),
+                stage,
+            });
+        }
+        let blob = self
+            .plan_dir
+            .join(BINARIES_DIR)
+            .join(&dir_name)
+            .join(BLOB_FILE);
+        assert_no_symlink_ancestors(&self.env_dir, &blob)?;
+        atomic_write_bytes(&blob, bytes)?;
+        Ok(blob)
+    }
+
+    /// Re-read a staged binary's blob and re-verify its SHA-256 against
+    /// `binary.digest`, returning the bytes on match. [`Self::put_binary_blob`]
+    /// hashes on ingest, but the bytes on disk are untrusted at apply-time —
+    /// this closes the read-side integrity check and fails closed with
+    /// [`StagingError::DigestMismatch`].
+    pub fn verify_binary_on_disk(&self, binary: &BinaryArtifact) -> Result<Vec<u8>, StagingError> {
+        let (dir_name, expected_hex) = digest_dir_name(&binary.digest)?;
+        let blob = self
+            .plan_dir
+            .join(BINARIES_DIR)
+            .join(dir_name)
+            .join(BLOB_FILE);
+        // The staging tree is untrusted at apply time: refuse a symlinked or
+        // non-regular blob before reading, so the integrity check can't be
+        // tricked into following a symlink out of the tree or blocking on a FIFO.
+        let bytes = read_regular_file_in(&self.env_dir, &blob)?;
+        let actual_hex = crate::plan::sha256_hex(&bytes);
+        if actual_hex != expected_hex {
+            return Err(StagingError::DigestMismatch {
+                name: binary.name.clone(),
+                expected: binary.digest.clone(),
+                actual: format!("sha256:{actual_hex}"),
+            });
+        }
+        Ok(bytes)
+    }
+
     /// Move the plan to `to`, gated by [`is_valid_transition`], rewriting
     /// `state.json` atomically and appending an audit line. Serialized by the
     /// per-env `.lock`. Returns the new state.
@@ -1118,6 +1464,13 @@ fn transition_locked(
 // ---------------------------------------------------------------------------
 // Retention
 // ---------------------------------------------------------------------------
+
+/// Opaque import-receipt pair: `(receipt_bytes, sig_bytes)`.
+///
+/// Returned by [`UpdatesRoot::read_import_receipt`]. Building and verifying the
+/// receipt content is the [`crate::envelope`] module's responsibility; this
+/// layer only stores and retrieves the raw byte pairs.
+pub type ImportReceiptPair = (Vec<u8>, Vec<u8>);
 
 /// Retention policy for terminal plan directories.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1189,7 +1542,12 @@ fn safe_segment(segment: &str, kind: &'static str) -> Result<(), StagingError> {
 /// enumeration.
 fn validate_plan_id(plan_id: &str) -> Result<(), StagingError> {
     safe_segment(plan_id, "plan_id")?;
-    if plan_id == AUDIT_DIR || plan_id == LOCK_FILE {
+    if plan_id == AUDIT_DIR
+        || plan_id == LOCK_FILE
+        || plan_id == CAS_DIR
+        || plan_id == IMPORT_RECEIPT_FILE
+        || plan_id == IMPORT_RECEIPT_SIG_FILE
+    {
         return Err(StagingError::UnsafeSegment {
             kind: "plan_id",
             segment: plan_id.to_string(),
@@ -1205,7 +1563,7 @@ fn validate_plan_id(plan_id: &str) -> Result<(), StagingError> {
 /// TOCTOU window is bounded to the lock scope. Mirrors the deployer's
 /// `path_safety::assert_no_symlink_ancestors`. No-op when `target` is not under
 /// `root`.
-fn assert_no_symlink_ancestors(root: &Path, target: &Path) -> Result<(), StagingError> {
+pub(crate) fn assert_no_symlink_ancestors(root: &Path, target: &Path) -> Result<(), StagingError> {
     let Ok(suffix) = target.strip_prefix(root) else {
         return Ok(());
     };
@@ -1235,7 +1593,7 @@ fn assert_no_symlink_ancestors(root: &Path, target: &Path) -> Result<(), Staging
 /// guard — reject a symlink at any path component (an escape) and a non-regular
 /// final file (a FIFO/device/socket/directory would block or return non-file
 /// bytes) *before* `fs::read` follows anything dangerous.
-fn read_regular_file_in(root: &Path, path: &Path) -> Result<Vec<u8>, StagingError> {
+pub(crate) fn read_regular_file_in(root: &Path, path: &Path) -> Result<Vec<u8>, StagingError> {
     assert_no_symlink_ancestors(root, path)?;
     let meta = fs::symlink_metadata(path).map_err(|source| StagingError::Io {
         path: path.to_path_buf(),
@@ -1255,7 +1613,7 @@ fn read_regular_file_in(root: &Path, path: &Path) -> Result<Vec<u8>, StagingErro
 /// Validate a `sha256:<64 hex>` digest, returning its directory name
 /// (`sha256-<lowercase hex>`) and the validated lowercase hex — so callers that
 /// need both parse the digest once.
-fn digest_dir_name(digest: &str) -> Result<(String, String), StagingError> {
+pub(crate) fn digest_dir_name(digest: &str) -> Result<(String, String), StagingError> {
     let hex = digest
         .strip_prefix("sha256:")
         .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
@@ -1820,6 +2178,27 @@ mod tests {
     }
 
     #[test]
+    fn list_strict_fails_closed_on_corrupt_marker() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        apply_plan(&root, "old", 5);
+
+        // Clean tree: strict and forgiving enumeration agree.
+        assert_eq!(root.list_strict().unwrap().len(), 1);
+
+        // Corrupt the marker: `list()` silently skips it, so a GC computing
+        // its referenced-blob set from `list()` would see the plan's blobs as
+        // orphaned. `list_strict()` must fail closed instead.
+        let marker = tmp.path().join("prod").join("old").join(STATE_FILE);
+        fs::write(&marker, b"{ not valid json").unwrap();
+        assert!(root.list().unwrap().is_empty());
+        assert!(matches!(
+            root.list_strict().unwrap_err(),
+            StagingError::CorruptAdmissionState { .. }
+        ));
+    }
+
+    #[test]
     fn begin_checked_predicate_reentering_lock_fails_fast_not_deadlock() {
         let tmp = TempDir::new().unwrap();
         let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
@@ -2091,10 +2470,17 @@ mod tests {
     #[test]
     fn begin_rejects_reserved_plan_ids() {
         // Reserved names would collide with the staging infrastructure: a plan
-        // dir named `audit` clobbers the audit-log dir, `.lock` the env lock.
+        // dir named `audit` clobbers the audit-log dir, `.lock` the env lock,
+        // `cas` the import CAS dir, and the receipt files the import receipt.
         let tmp = TempDir::new().unwrap();
         let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
-        for reserved in ["audit", ".lock"] {
+        for reserved in [
+            "audit",
+            ".lock",
+            "cas",
+            "import-receipt.json",
+            "import-receipt.json.sig",
+        ] {
             let v = verified(plan_with(reserved, "prod", 1, vec![]));
             assert!(
                 matches!(
@@ -2752,5 +3138,403 @@ mod tests {
                 Err(StagingError::MalformedDigest { .. })
             ));
         }
+    }
+
+    fn binary(name: &str, bytes: &[u8], target: &str) -> BinaryArtifact {
+        BinaryArtifact {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            target: target.to_string(),
+            digest: digest_of(bytes),
+            source: None,
+        }
+    }
+
+    fn plan_with_binaries(
+        plan_id: &str,
+        env_id: &str,
+        sequence: u64,
+        binaries: Vec<BinaryArtifact>,
+    ) -> UpdatePlan {
+        UpdatePlan {
+            schema: crate::plan::UPDATE_PLAN_SCHEMA_V1.to_string(),
+            plan_id: plan_id.to_string(),
+            env_id: env_id.to_string(),
+            sequence,
+            created_at: Utc::now(),
+            nonce: "test-nonce".to_string(),
+            target: serde_json::json!({}),
+            artifacts: vec![],
+            binaries,
+            compat: CompatRequirements::default(),
+            rollback: RollbackPolicy {
+                policy: RollbackKind::Auto,
+                health_timeout_s: 60,
+                on_fail: OnFail::Restore,
+            },
+        }
+    }
+
+    #[test]
+    fn put_binary_blob_happy_path() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        let payload = b"binary-executable";
+        let bin = binary("gtc", payload, "x86_64-unknown-linux-gnu");
+        let v = verified(plan_with_binaries("plan-1", "prod", 1, vec![bin.clone()]));
+        let staged = root.begin(&v, b"p", b"s").unwrap();
+
+        let blob = staged.put_binary_blob(&bin, payload).unwrap();
+        assert_eq!(fs::read(&blob).unwrap(), payload);
+        assert!(blob.ends_with(BLOB_FILE));
+        // The blob lives under binaries/, not artifacts/.
+        assert!(blob.to_string_lossy().contains("/binaries/"));
+    }
+
+    #[test]
+    fn put_binary_blob_rejects_digest_mismatch() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        let payload = b"binary-executable";
+        let bin = binary("gtc", payload, "x86_64-unknown-linux-gnu");
+        let v = verified(plan_with_binaries("plan-1", "prod", 1, vec![bin.clone()]));
+        let staged = root.begin(&v, b"p", b"s").unwrap();
+
+        assert!(matches!(
+            staged.put_binary_blob(&bin, b"tampered-binary"),
+            Err(StagingError::DigestMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn verify_binary_on_disk_rejects_tampered_blob() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        let payload = b"binary-executable";
+        let bin = binary("gtc", payload, "x86_64-unknown-linux-gnu");
+        let v = verified(plan_with_binaries("plan-1", "prod", 1, vec![bin.clone()]));
+        let staged = root.begin(&v, b"p", b"s").unwrap();
+        let blob = staged.put_binary_blob(&bin, payload).unwrap();
+
+        // Tamper the blob on disk after writing.
+        fs::write(&blob, b"corrupted").unwrap();
+        assert!(matches!(
+            staged.verify_binary_on_disk(&bin),
+            Err(StagingError::DigestMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn verify_binary_on_disk_happy_path() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        let payload = b"binary-executable";
+        let bin = binary("gtc", payload, "x86_64-unknown-linux-gnu");
+        let v = verified(plan_with_binaries("plan-1", "prod", 1, vec![bin.clone()]));
+        let staged = root.begin(&v, b"p", b"s").unwrap();
+        staged.put_binary_blob(&bin, payload).unwrap();
+
+        // Verify the untampered blob round-trips correctly.
+        let bytes = staged.verify_binary_on_disk(&bin).unwrap();
+        assert_eq!(bytes, payload);
+    }
+
+    #[test]
+    fn put_binary_blob_rejects_wrong_stage() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        let payload = b"binary-executable";
+        let bin = binary("gtc", payload, "x86_64-unknown-linux-gnu");
+        let v = verified(plan_with_binaries("plan-1", "prod", 1, vec![bin.clone()]));
+        let staged = root.begin(&v, b"p", b"s").unwrap();
+
+        // Advance past Downloading — put_binary_blob should reject.
+        staged.transition(UpdateStage::Inbox).unwrap();
+        assert!(matches!(
+            staged.put_binary_blob(&bin, payload),
+            Err(StagingError::ArtifactNotDownloading { .. })
+        ));
+    }
+
+    // ------------------------------------------------------------------
+    // CAS tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn cas_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        let payload = b"cas-blob-content";
+        let digest = digest_of(payload);
+
+        let path = root.cas_put(&digest, payload).unwrap();
+        assert!(path.exists());
+        // The blob is stored at cas/sha256-<hex>, a flat file (no /blob suffix).
+        assert!(path.to_string_lossy().contains("/cas/sha256-"));
+
+        let read_back = root.cas_get(&digest).unwrap();
+        assert_eq!(read_back, payload);
+    }
+
+    #[test]
+    fn cas_put_idempotent_same_content() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        let payload = b"identical-content";
+        let digest = digest_of(payload);
+
+        let path1 = root.cas_put(&digest, payload).unwrap();
+        let path2 = root.cas_put(&digest, payload).unwrap();
+        assert_eq!(path1, path2);
+        // Content is still intact after the idempotent overwrite.
+        assert_eq!(root.cas_get(&digest).unwrap(), payload);
+    }
+
+    #[test]
+    fn cas_put_rejects_digest_mismatch() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        let payload = b"actual-content";
+        // Declare the digest of different bytes.
+        let wrong_digest = digest_of(b"other-content");
+
+        assert!(matches!(
+            root.cas_put(&wrong_digest, payload),
+            Err(StagingError::DigestMismatch { .. })
+        ));
+        // Nothing was written.
+        assert!(!root.cas_contains(&wrong_digest).unwrap());
+    }
+
+    #[test]
+    fn cas_contains_and_list_and_remove() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        let blob_a = b"blob-alpha";
+        let blob_b = b"blob-bravo";
+        let digest_a = digest_of(blob_a);
+        let digest_b = digest_of(blob_b);
+
+        // Empty CAS.
+        assert!(!root.cas_contains(&digest_a).unwrap());
+        assert!(root.cas_list().unwrap().is_empty());
+
+        // Populate.
+        root.cas_put(&digest_a, blob_a).unwrap();
+        root.cas_put(&digest_b, blob_b).unwrap();
+        assert!(root.cas_contains(&digest_a).unwrap());
+        assert!(root.cas_contains(&digest_b).unwrap());
+
+        let listed: HashSet<String> = root.cas_list().unwrap().into_iter().collect();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.contains(&digest_a));
+        assert!(listed.contains(&digest_b));
+
+        // Remove one.
+        root.cas_remove(&digest_a).unwrap();
+        assert!(!root.cas_contains(&digest_a).unwrap());
+        assert!(root.cas_contains(&digest_b).unwrap());
+        assert_eq!(root.cas_list().unwrap().len(), 1);
+
+        // Idempotent remove of an already-absent blob.
+        root.cas_remove(&digest_a).unwrap();
+    }
+
+    #[test]
+    fn cas_get_rejects_tampered_blob() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        let payload = b"original-content";
+        let digest = digest_of(payload);
+
+        let path = root.cas_put(&digest, payload).unwrap();
+        // Tamper the blob on disk after writing.
+        fs::write(&path, b"corrupted-content").unwrap();
+        assert!(matches!(
+            root.cas_get(&digest),
+            Err(StagingError::DigestMismatch { .. })
+        ));
+    }
+
+    // ------------------------------------------------------------------
+    // Preflight tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn preflight_all_in_envelope_ok() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        let art_bytes = b"artifact-data";
+        let bin_bytes = b"binary-data";
+        let art = artifact("pack-a", art_bytes);
+        let bin = binary("gtc", bin_bytes, "x86_64-unknown-linux-gnu");
+
+        // Envelope carries both digests — CAS is empty.
+        let envelope: HashSet<String> = [art.digest.clone(), bin.digest.clone()]
+            .into_iter()
+            .collect();
+        root.preflight_digests(&[art], &[bin], &envelope).unwrap();
+    }
+
+    #[test]
+    fn preflight_some_in_cas_ok() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        let art_bytes = b"artifact-data";
+        let bin_bytes = b"binary-data";
+        let art = artifact("pack-a", art_bytes);
+        let bin = binary("gtc", bin_bytes, "x86_64-unknown-linux-gnu");
+
+        // Envelope carries the artifact; the binary is already in the CAS.
+        root.cas_put(&bin.digest, bin_bytes).unwrap();
+        let envelope: HashSet<String> = [art.digest.clone()].into_iter().collect();
+        root.preflight_digests(&[art], &[bin], &envelope).unwrap();
+    }
+
+    #[test]
+    fn preflight_missing_fails_closed() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        let art_a = artifact("pack-a", b"data-a");
+        let art_b = artifact("pack-b", b"data-b");
+        let bin = binary("gtc", b"bin-data", "x86_64-unknown-linux-gnu");
+
+        // Empty envelope, empty CAS — all three must be reported missing.
+        let envelope: HashSet<String> = HashSet::new();
+        let err = root
+            .preflight_digests(
+                &[art_a.clone(), art_b.clone()],
+                std::slice::from_ref(&bin),
+                &envelope,
+            )
+            .unwrap_err();
+
+        match err {
+            StagingError::PreflightMissing {
+                missing,
+                missing_count,
+            } => {
+                // All three are missing, and the error lists EVERY one.
+                assert_eq!(missing_count, 3);
+                assert_eq!(missing.len(), 3);
+                assert!(missing.contains(&art_a.digest));
+                assert!(missing.contains(&art_b.digest));
+                assert!(missing.contains(&bin.digest));
+            }
+            other => panic!("expected PreflightMissing, got: {other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Import receipt tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn receipt_write_read_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        let receipt = b"receipt-bytes-here";
+        let sig = b"receipt-sig-bytes";
+
+        root.write_import_receipt(receipt, sig).unwrap();
+        let (r, s) = root
+            .read_import_receipt()
+            .unwrap()
+            .expect("receipt present");
+        assert_eq!(r, receipt);
+        assert_eq!(s, sig);
+    }
+
+    #[test]
+    fn receipt_absent_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        assert!(root.read_import_receipt().unwrap().is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // apply_retention must NOT touch cas/ or the receipt
+    // ------------------------------------------------------------------
+
+    /// Regression: if only the sig file exists on disk (simulating a crash
+    /// after sig-write but before receipt-write), `read_import_receipt` must
+    /// return `Ok(None)` — not a hard I/O error.
+    #[test]
+    fn receipt_orphaned_sig_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        // Manually place only the sig sidecar (no receipt file).
+        let sig_path = root.env_dir().join(IMPORT_RECEIPT_SIG_FILE);
+        fs::create_dir_all(root.env_dir()).unwrap();
+        fs::write(&sig_path, b"orphaned-sig").unwrap();
+
+        // Must be None, not Err.
+        assert!(
+            root.read_import_receipt().unwrap().is_none(),
+            "orphaned sig without receipt must read as None"
+        );
+    }
+
+    /// Regression: `cas_contains` must not follow symlinks. A symlink at
+    /// the CAS path pointing to an existing file must return false — the
+    /// blob is not a regular file in the CAS store.
+    #[cfg(unix)]
+    #[test]
+    fn cas_contains_rejects_symlink() {
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("decoy");
+        fs::write(&target, b"out-of-tree content").unwrap();
+
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+        let payload = b"real-blob";
+        let digest = digest_of(payload);
+
+        // Write the real blob, then replace it with a symlink.
+        let path = root.cas_put(&digest, payload).unwrap();
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        // cas_contains must return false (not follow the symlink).
+        assert!(
+            !root.cas_contains(&digest).unwrap(),
+            "cas_contains must not follow symlinks"
+        );
+    }
+
+    #[test]
+    fn apply_retention_leaves_cas_and_receipt_intact() {
+        let tmp = TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(tmp.path(), "prod").unwrap();
+
+        // Populate the CAS and receipt.
+        let blob = b"cas-blob";
+        let digest = digest_of(blob);
+        root.cas_put(&digest, blob).unwrap();
+        root.write_import_receipt(b"receipt", b"sig").unwrap();
+
+        // Create two terminal plans (enough to evict at keep=0).
+        for (id, seq) in [("t1", 1), ("t2", 2)] {
+            let p = root
+                .begin(&verified(plan_with(id, "prod", seq, vec![])), b"p", b"s")
+                .unwrap();
+            p.transition(UpdateStage::Failed).unwrap();
+        }
+
+        // Evict ALL terminal plans.
+        let report = root
+            .apply_retention(&RetentionPolicy { keep_terminal: 0 })
+            .unwrap();
+        assert_eq!(report.evicted.len(), 2);
+
+        // CAS and receipt are untouched.
+        assert!(root.cas_contains(&digest).unwrap());
+        assert_eq!(root.cas_get(&digest).unwrap(), blob);
+        let (r, s) = root
+            .read_import_receipt()
+            .unwrap()
+            .expect("receipt present");
+        assert_eq!(r, b"receipt");
+        assert_eq!(s, b"sig");
     }
 }
