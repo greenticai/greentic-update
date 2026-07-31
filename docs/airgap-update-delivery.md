@@ -3,13 +3,28 @@
 > **Status:** Approved (rev 2, 2026-07-28).  Design-gate round 1 complete; all
 > findings folded in (see [Design-gate round 1 summary](#design-gate-round-1-summary)).
 >
-> **Implementation:** Phases A and B shipped on the dev lane (2026-07-29):
-> envelope library + `op updates export` (A); import CAS + signed receipts +
-> `op updates import`/`cas-gc`, in-band binary consumption in
-> `greentic-start`, receipt-based delta export, `export --binary-blob`
-> staging, the Tier 1 E2E, and the operator quickstart
-> (`greentic-deployer/docs/airgap-quickstart.md`) (B).  Phases C and D are
-> not started.
+> **Implementation:** Phases A, B and C shipped on the dev lane.
+>
+> - **A + B (2026-07-29) — Tier 1, sneakernet.**  Envelope library +
+>   `op updates export` (A); import CAS + signed receipts +
+>   `op updates import`/`cas-gc`, in-band binary consumption in
+>   `greentic-start`, receipt-based delta export, `export --binary-blob`
+>   staging, the Tier 1 E2E, and the operator quickstart
+>   (`greentic-deployer/docs/airgap-quickstart.md`) (B).
+> - **C (2026-07-30/31) — Tier 2, in-gap serving.**  `UpdateChannelConfig`
+>   gains `blob_base_url` + `insecure_http` with deny-by-default resolution;
+>   `op updates config-set` exposes them; `op updates import --push-to <DIR>`
+>   writes the static serving layout (`plan/plan.json` raw signed bytes,
+>   `plan/plan.json.sig`, `plan/meta` last, `blobs/sha256-<hex>`) under a
+>   monotonic-sequence guard; `greentic-start` falls back to the blob mirror
+>   when a plan carries `source=None`; and the serving guide
+>   (`greentic-deployer/docs/airgap-serving.md`) ships verified nginx and
+>   Caddy configurations.  Producer and consumer are contract-locked by tests
+>   on both sides.
+>
+> **Phase D (trust rotation) is not started.**  The optional turnkey
+> `greentic-plan-server` listed under Phase C below was descoped, not shipped:
+> Tier 2 is poll-only and the live plan server remains deferred work.
 >
 > **Scope:** Design only.  Per-phase implementation plans are separate artifacts.
 
@@ -47,7 +62,9 @@ defense, critical infrastructure, and regulated enterprise — have no outbound
 network.  The update platform must support these environments without
 duplicating the trust model, the staging state machine, or the apply path.
 
-Specific gaps today:
+Specific gaps at design time (2026-07-28).  **Items 1 and 2 are resolved by
+Phases A-C; item 3 is resolved except for key rotation, which is Phase D.**
+Retained as the historical motivation for the design, not as current state:
 
 1. `src/envelope.rs` is a Phase 5 stub (lines 1-9): the module doc specifies
    the exact design but the implementation is empty.
@@ -414,14 +431,17 @@ Import tool additionally pushes to in-gap serving infrastructure:
 - **greentic-start blob-mirror fallback** for plan/binary fetch.
 
 Content updates need no client changes.  **Binary self-update requires
-`greentic-start` at or above the Phase C version** — today's runtimes skip
-`source=None` binaries (`greentic-start/src/revision_serve.rs:2071-2082`)
-and have no blob-mirror config.  A one-time out-of-band fleet upgrade is
-required to enroll (same precedent as the `_`-broadcast bootstrap).
+`greentic-start` at or above the Phase C publish** — runtimes older than that
+skip `source=None` binaries and have no blob-mirror config, so a one-time
+out-of-band fleet upgrade is required to enroll (same precedent as the
+`_`-broadcast bootstrap).  The three version floors that actually apply —
+staging, autonomous content `apply`, and binary convergence — are documented
+with concrete versions in `greentic-deployer/docs/airgap-serving.md`.
 
-Optional turnkey `greentic-plan-server` (public crate, file-backed, SSE) is
-a later Phase C deliverable.  It does NOT depend on the private in-memory
-`greentic-updates-server`.
+Optional turnkey `greentic-plan-server` (public crate, file-backed, SSE) was
+listed as a later Phase C deliverable but was **descoped**: Tier 2 shipped
+poll-only and the live plan server is deferred work.  It does NOT depend on
+the private in-memory `greentic-updates-server`.
 
 ---
 
@@ -507,20 +527,29 @@ tamper, and traversal tests PLUS the full hostile-archive test battery.
 including binary swap, restart, rollback, with all existing rollback
 guarantees.
 
-### Phase C — In-gap fleet serving (Tier 2)
+### Phase C — In-gap fleet serving (Tier 2) — ✅ SHIPPED 2026-07-30/31
 
 **Repos:** `greentic-deployer`, `greentic-start`, `greentic-deploy-spec`.
 
-- `op updates import --push-to` / static-dir writer.
-- `blob_base_url` + insecure-registries fields on `UpdateChannelConfig`
+- ✅ `op updates import --push-to` / static-dir writer, guarded by monotonic
+  sequence AND same-sequence-implies-same-digest.
+- ✅ `blob_base_url` + `insecure_http` fields on `UpdateChannelConfig`
   (additive via `#[non_exhaustive]` + flatten catch-all).
-- `greentic-start` mirror fallback in poll loop + binary fetch.
-- nginx/caddy serving layout documentation.
-- Optional turnkey `greentic-plan-server` public crate (file-backed, SSE).
+- ✅ `greentic-start` mirror fallback in poll loop + binary fetch.  A mirror
+  failure is a hard error, never a swallowed `Ok(200)` — the poll loop
+  advances its sequence on any 2xx, so swallowing would strand the fleet.
+- ✅ nginx/caddy serving layout documentation, both configs verified by
+  execution against real writer output.
+- ❌ Optional turnkey `greentic-plan-server` public crate — **descoped**, not
+  shipped.  Tier 2 is poll-only.
 
-**Ship criteria:** fleet runtimes at or above Phase C version converge
-(content AND binaries) from one import point; minimum client version
-documented.
+**Ship criteria — met.**  Fleet runtimes at or above the Phase C publish
+converge (content AND binaries) from one import point, and the minimum client
+versions are documented in `greentic-deployer/docs/airgap-serving.md`
+(three distinct floors: staging, autonomous content `apply`, binary
+convergence).  Both sides are covered by tests: the deployer proves the
+serving directory it writes, `greentic-start` proves the poll → notify →
+mirror → swap path it reads, against the same wire layout.
 
 ### Phase D — Trust rotation + hardening
 
@@ -552,7 +581,7 @@ recovery tested; hard-reject staleness mode functional.
 | R4 | Rotation ceremony practicality | Threshold-of-rotation-keys is required from day one (finding 1), so the offline multi-holder ceremony must be well-tooled; rotations are rare, and Phase D owns the ceremony UX. |
 | R5 | Heterogeneous target triples in the gap | Default: all targets. `--targets` flag to slim the export. |
 | R6 | Private `greentic-updates-server` must not become a dependency | Static files + new public crate only. |
-| R7 | Fleet binary convergence needs `greentic-start` at or above Phase C version | One-time out-of-band upgrade to enroll; document the floor version (same shape as the `_`-broadcast bootstrap deadlock). |
+| R7 | Fleet binary convergence needs `greentic-start` at or above Phase C version | **Discharged.** One-time out-of-band upgrade to enroll; the floor versions are documented in `greentic-deployer/docs/airgap-serving.md` — three of them, not one (staging works on any poll-capable build, autonomous content `apply` needs v1.1.9, binary convergence needs the Phase C publish). |
 | R8 | Durable import CAS adds disk pressure inside the gap | Refcount/GC rules + `op updates cas-gc` verb in Phase B scope. |
 | R-License | License/entitlement-gated exports are out of scope | Trust is key-based, not license-based. This is a product decision, not a security gap. Replicated-style license gating can be layered on later without changing the envelope format. |
 
@@ -698,15 +727,22 @@ The plan-server wire contract is small and unchanged by this design:
 | `GET` | `/v1/environments/<env>/events` | Anonymous | SSE stream (optional) |
 
 In-gap Tier 2 serving uses the same routes.  The static-dir layout maps
-directly to these paths.  The optional turnkey `greentic-plan-server` binary
-(Phase C) implements the same contract as the production CF Worker and the
-private in-memory Rust server.
+directly to these paths — as shipped, two rewrites are needed (`/plan` →
+`plan/plan.json`, `/plan.sig` → `plan/plan.json.sig`); `/plan/meta` and
+`/blobs/*` are identity maps.  The optional turnkey `greentic-plan-server`
+binary was descoped from Phase C and remains unbuilt; when it lands it is to
+implement the same contract as the production CF Worker and the private
+in-memory Rust server.
 
 ---
 
 ## Appendix B: Code references
 
-All citations verified against `develop` branch as of 2026-07-28.
+All citations verified against `develop` branch as of 2026-07-28 — i.e. the
+**pre-implementation** tree.  Several no longer resolve: `envelope.rs` is no
+longer a 9-line stub, and the two `source=None` rejection sites named below
+were the gaps Phases B and C closed.  Left as a record of what the design was
+written against; do not use these line numbers to navigate current code.
 
 | Claim | Location | Line(s) |
 |-------|----------|---------|
