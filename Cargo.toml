@@ -4,7 +4,7 @@ name = "greentic-update"
 # (standard fleet dev lane — 1.1 stable vs 1.2 dev keeps the two lanes on distinct
 # minors). See the dependency note below for why one crate cannot serve both lanes
 # from a single publish.
-version = "1.3.0-research.1"
+version = "1.2.0-dev.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic update platform foundation: signed update plans, installed-artifact catalogue/diff, staging, and airgap envelopes."
@@ -49,11 +49,11 @@ stream = ["dep:reqwest", "reqwest/blocking"]
 # the dev lane (`>=1.2.0-dev`) excludes stable 1.1.x, and a range covering 1.1.x
 # silently excludes every `1.2.0-dev.*`. There is no union.
 #
-# `develop` therefore pins one lane. Since greentic-start#595 that is the
-# research line: greentic-runner develop =-pins the 1.3.0-research family, and
-# 1.2.0-dev.N and 1.3.0-research.N cannot share one graph. 1.3.0-research.4 is
-# the first research build carrying develop's distributor-client API.
-greentic-distributor-client = ">=1.3.0-research.4, <1.4.0-0"
+# `develop` therefore pins one lane: the 1.2.0-dev lane, which the whole
+# greentic-designer chain moved back onto on 2026-09-22 (it had been on the
+# 1.3.0-research line since greentic-start#595). 1.2.0-dev.N and
+# 1.3.0-research.N of one crate cannot share a graph.
+greentic-distributor-client = ">=1.2.0-dev, <1.3.0-0"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 # Staging FSM (ungated `staging` module): `fs4` for the per-env `.lock` flock and
 # the independent per-file audit-log flock; `tempfile` for the write-tmp → fsync
@@ -92,13 +92,3 @@ time = "0.3"
 # Enrollment integration test: local mock CA + async runtime.
 httpmock = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-
-# Research-line chain (greentic-start#595). crates.io publishing is locked
-# fleet-wide, so greentic-distributor-client 1.3.0-research.4 and the
-# greentic-secrets 1.3.0-research.3 it is built against exist only in git. A
-# patch section does not travel into a published crate; every consumer carries
-# the same patch at its own root.
-# TO UNWIND once publishing is restored: delete this block, `cargo update`.
-[patch.crates-io]
-greentic-distributor-client = { git = "https://github.com/greenticai/greentic-distributor-client", rev = "d594bb896c9722f439bf3c0cb98a3b85afb9b540" }
-greentic-secrets-lib = { git = "https://github.com/greenticai/greentic-secrets", rev = "633934c31a4d0413885bbced87acbc29a03c7b28" }
