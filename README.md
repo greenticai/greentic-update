@@ -37,7 +37,11 @@ This crate is the transport-agnostic core, consumed by:
 | `envelope`  | Airgap update-bundle wrapper + import scanner                    | P5    |
 | `binswap`   | Verified on-disk binary swap + rollback (binary self-update)     | P7    |
 
-> Status: foundation skeleton. Phase 0 (P0a/P0c) is under active development.
+> Status: in production use on the dev lane. `plan`, `catalogue`, `staging`,
+> `envelope` and `binswap` are all shipped and consumed by `greentic-deployer`
+> (`op updates …`) and `greentic-start` (staging, apply, binary self-update).
+> The airgap delivery path is complete through Tier 2 in-gap serving — see
+> [docs/airgap-update-delivery.md](docs/airgap-update-delivery.md).
 
 ## Build & test
 
