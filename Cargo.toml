@@ -90,5 +90,5 @@ ed25519-dalek = { version = "3", features = ["pkcs8", "pem"] }
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring", "x509-parser"] }
 time = "0.3"
 # Enrollment integration test: local mock CA + async runtime.
-httpmock = "0.8"
+httpmock = "0.9"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
